@@ -45,6 +45,11 @@ type form struct {
 	inputs [fieldCount]textinput.Model
 	keyPad textarea.Model
 
+	// editingID is empty for a new entry and the server's ID when editing one.
+	// It decides between Store.Add and Store.Update, and keeps keys/<id>.pem
+	// pointing at the same file.
+	editingID string
+
 	auth    model.AuthMethod
 	focused int
 	err     string
@@ -77,6 +82,39 @@ func newForm(width, height int) form {
 
 	f.applyAuth()
 	f.setSize(width, height)
+	f.focus(fieldName)
+	return f
+}
+
+// newFormFor builds an edit form pre-filled from srv.
+//
+// The key body textarea stays empty even for key auth: we never read the stored
+// pem back into the UI. Leaving it blank keeps the existing KeyPath; pasting a
+// new key overwrites keys/<id>.pem, which is the same path because the ID does
+// not change.
+func newFormFor(srv model.Server, width, height int) form {
+	f := newForm(width, height)
+	f.editingID = srv.ID
+	f.auth = srv.Auth
+	if f.auth == "" {
+		f.auth = model.AuthPassword
+	}
+
+	f.inputs[fieldName].SetValue(srv.Name)
+	f.inputs[fieldHost].SetValue(srv.Host)
+	port := srv.Port
+	if port == 0 {
+		port = model.DefaultPort
+	}
+	f.inputs[fieldPort].SetValue(strconv.Itoa(port))
+	f.inputs[fieldUser].SetValue(srv.User)
+	if f.auth == model.AuthPassword {
+		f.inputs[fieldSecret].SetValue(srv.Password)
+	} else {
+		f.inputs[fieldSecret].SetValue(srv.KeyPath)
+	}
+
+	f.applyAuth()
 	f.focus(fieldName)
 	return f
 }
@@ -320,6 +358,7 @@ func (f *form) Server() (model.Server, string, error) {
 	}
 
 	srv := model.Server{
+		ID:   f.editingID,
 		Name: strings.TrimSpace(f.inputs[fieldName].Value()),
 		Host: strings.TrimSpace(f.inputs[fieldHost].Value()),
 		Port: port,

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	xssh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/pyjhoop/ssh-client/internal/model"
 	sshpkg "github.com/pyjhoop/ssh-client/internal/ssh"
@@ -26,7 +29,7 @@ func TestConnectPumpsOutputAndForwardsInput(t *testing.T) {
 	sess, err := sshpkg.Connect(model.Server{
 		Host: srv.host, Port: srv.port,
 		User: "tester", Auth: model.AuthPassword, Password: "secret",
-	}, 80, 24)
+	}, 80, 24, srv.trusted(t))
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -62,7 +65,7 @@ func TestConnectRejectsBadPassword(t *testing.T) {
 	_, err := sshpkg.Connect(model.Server{
 		Host: srv.host, Port: srv.port,
 		User: "tester", Auth: model.AuthPassword, Password: "wrong",
-	}, 80, 24)
+	}, 80, 24, srv.trusted(t))
 	if err == nil {
 		t.Fatal("want an authentication error")
 	}
@@ -76,7 +79,7 @@ func TestOutputChannelClosesOnRemoteExit(t *testing.T) {
 	sess, err := sshpkg.Connect(model.Server{
 		Host: srv.host, Port: srv.port,
 		User: "tester", Auth: model.AuthPassword, Password: "secret",
-	}, 80, 24)
+	}, 80, 24, srv.trusted(t))
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -125,7 +128,23 @@ func readUntil(t *testing.T, sess *sshpkg.Session, want string) string {
 type testServer struct {
 	host    string
 	port    int
+	hostKey xssh.PublicKey
 	resized chan [2]int
+}
+
+// addr is what the host key callback sees and what known_hosts lines key on.
+func (s *testServer) addr() string { return net.JoinHostPort(s.host, strconv.Itoa(s.port)) }
+
+// trusted returns Options with the server's own host key already on file, which
+// is the "known and unchanged" path.
+func (s *testServer) trusted(t *testing.T) sshpkg.Options {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "known_hosts")
+	line := knownhosts.Line([]string{knownhosts.Normalize(s.addr())}, s.hostKey)
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatalf("write known_hosts: %v", err)
+	}
+	return sshpkg.Options{KnownHostsFiles: []string{path}}
 }
 
 func startTestServer(t *testing.T) *testServer {
@@ -164,7 +183,12 @@ func startTestServer(t *testing.T) *testServer {
 		t.Fatalf("parse port: %v", err)
 	}
 
-	srv := &testServer{host: host, port: port, resized: make(chan [2]int, 4)}
+	srv := &testServer{
+		host:    host,
+		port:    port,
+		hostKey: signer.PublicKey(),
+		resized: make(chan [2]int, 4),
+	}
 
 	// Cleanups run last-in-first-out: close the listener first, then wait for
 	// the accept loop and its connection handlers to drain.

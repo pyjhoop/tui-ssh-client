@@ -32,6 +32,7 @@ const (
 	rightEmpty rightMode = iota
 	rightForm
 	rightTerminal
+	rightError
 )
 
 // escapeHint is the key that moves focus out of a live session.
@@ -63,6 +64,24 @@ type App struct {
 	sessionName string
 	sessionAddr string
 
+	// scrollOff lifts the terminal viewport this many lines into the vt
+	// scrollback. It survives new output on purpose — the screen must not jump
+	// while you are reading history — and any keystroke drops back to 0.
+	scrollOff int
+
+	// hostKeys carries trust-on-first-use questions from the dialing goroutine.
+	// It is drained by the same pump pattern as session output.
+	hostKeys chan *sshpkg.HostKeyPrompt
+
+	// confirm, when set, replaces the right panel body and swallows every key
+	// that is not an answer to it.
+	confirm *confirm
+
+	// lastAttempt is the server the current connect is for; the error card needs
+	// it to offer retry and edit.
+	lastAttempt model.Server
+	failErr     error
+
 	connecting string
 	status     string
 	errMsg     string
@@ -78,11 +97,12 @@ func New(store *config.Store) *App {
 		rightMode: rightEmpty,
 		sidebar:   newSidebar(nil, sidebarWidth-2, 10),
 		form:      newForm(40, 20),
+		hostKeys:  make(chan *sshpkg.HostKeyPrompt, 1),
 	}
 }
 
 func (a *App) Init() tea.Cmd {
-	return loadServers(a.store)
+	return tea.Batch(loadServers(a.store), waitForHostKey(a.hostKeys))
 }
 
 // ── messages ────────────────────────────────────────────────────────────────
@@ -117,6 +137,15 @@ type sessionEndedMsg struct {
 	gen int
 	err error
 }
+
+// hostKeyPromptMsg carries a fingerprint question from a dialing goroutine that
+// is blocked waiting for the answer.
+type hostKeyPromptMsg struct {
+	prompt *sshpkg.HostKeyPrompt
+}
+
+// hostKeyAnsweredMsg closes the confirm panel once the reply is on its way.
+type hostKeyAnsweredMsg struct{}
 
 // ── commands ────────────────────────────────────────────────────────────────
 
@@ -158,13 +187,61 @@ func saveServer(store *config.Store, srv model.Server, keyBody string) tea.Cmd {
 	}
 }
 
-func connect(srv model.Server, gen, cols, rows int) tea.Cmd {
+// updateServer is saveServer's counterpart for an existing entry. A blank key
+// body keeps whatever KeyPath the entry already had; a pasted one overwrites
+// keys/<id>.pem, which is the same file because the ID does not change.
+func updateServer(store *config.Store, srv model.Server, keyBody string) tea.Cmd {
 	return func() tea.Msg {
-		sess, err := sshpkg.Connect(srv, cols, rows)
+		if keyBody != "" {
+			path, err := store.SaveKey(srv.ID, keyBody)
+			if err != nil {
+				return serverSavedMsg{err: err}
+			}
+			srv.KeyPath = path
+		}
+		if err := srv.Validate(); err != nil {
+			return serverSavedMsg{err: err}
+		}
+		if err := store.Update(srv); err != nil {
+			return serverSavedMsg{err: err}
+		}
+		servers, err := store.Load()
+		return serverSavedMsg{servers: servers, err: err}
+	}
+}
+
+func removeServer(store *config.Store, id string) tea.Cmd {
+	return func() tea.Msg {
+		if err := store.Remove(id); err != nil {
+			return serversLoadedMsg{err: err}
+		}
+		servers, err := store.Load()
+		return serversLoadedMsg{servers: servers, err: err}
+	}
+}
+
+// connect resolves the known_hosts paths inside the command, not on the UI
+// goroutine: KnownHostsFiles stats the filesystem.
+func connect(store *config.Store, prompts chan<- *sshpkg.HostKeyPrompt, srv model.Server, gen, cols, rows int) tea.Cmd {
+	return func() tea.Msg {
+		opts := sshpkg.Options{
+			KnownHostsFiles: store.KnownHostsFiles(),
+			AppendKnownHost: store.AppendKnownHost,
+			Prompts:         prompts,
+		}
+		sess, err := sshpkg.Connect(srv, cols, rows, opts)
 		if err != nil {
 			return connectFailedMsg{gen: gen, err: err}
 		}
 		return connectedMsg{gen: gen, session: sess}
+	}
+}
+
+// waitForHostKey is the fingerprint-prompt pump, rescheduled after each
+// message exactly like waitForOutput.
+func waitForHostKey(ch <-chan *sshpkg.HostKeyPrompt) tea.Cmd {
+	return func() tea.Msg {
+		return hostKeyPromptMsg{prompt: <-ch}
 	}
 }
 
@@ -205,6 +282,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.sidebar.SetServers(a.servers)
 		a.warning = msg.warn
 		a.status = "saved"
+		if a.form.editingID != "" {
+			a.status = "updated"
+		}
 		a.rightMode = rightEmpty
 		a.focus = focusSidebar
 		return a, nil
@@ -230,9 +310,18 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.connecting = ""
-		a.rightMode = rightEmpty
+		a.confirm = nil
+		a.rightMode = rightError
 		a.focus = focusSidebar
-		a.errMsg = msg.err.Error()
+		a.failErr = msg.err
+		a.errMsg = firstLineOf(msg.err)
+		return a, nil
+
+	case hostKeyPromptMsg:
+		return a, tea.Batch(a.askHostKey(msg.prompt), waitForHostKey(a.hostKeys))
+
+	case hostKeyAnsweredMsg:
+		a.confirm = nil
 		return a, nil
 
 	case outputMsg:
@@ -275,6 +364,16 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
+	// A confirmation owns the keyboard while it is up. Unhandled keys are
+	// dropped rather than forwarded, so nothing leaks into the session behind it.
+	if a.confirm != nil {
+		cmd, handled := a.confirm.resolve(msg)
+		if handled {
+			a.confirm = nil
+		}
+		return cmd
+	}
+
 	// Session focus swallows everything except the escape key: the remote shell
 	// needs ctrl+c, ctrl+d, q and friends.
 	if a.focus == focusSession {
@@ -283,6 +382,11 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 			a.status = "session still running · select it again to go back"
 			return nil
 		}
+		if a.scrollKey(msg) {
+			return nil
+		}
+		// Any other key means "I am done reading history".
+		a.scrollOff = 0
 		a.sendKey(msg)
 		return nil
 	}
@@ -306,11 +410,28 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 				return nil
 			}
 			a.form.err = ""
+			if a.form.editingID != "" {
+				return updateServer(a.store, srv, keyBody)
+			}
 			return saveServer(a.store, srv, keyBody)
 		}
 		return cmd
 
 	default: // focusSidebar
+		// The error card offers its own actions; they take precedence over the
+		// list's while it is showing.
+		if a.rightMode == rightError {
+			switch msg.String() {
+			case "r":
+				return a.retryConnect()
+			case "e":
+				return a.editServer(a.lastAttempt)
+			case "esc":
+				a.dismissError()
+				return nil
+			}
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			a.quitting = true
@@ -318,6 +439,11 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 			return tea.Quit
 		case "enter":
 			return a.activateSelection()
+		case "e":
+			if it, ok := a.sidebar.Selected(); ok && !it.connect {
+				return a.editServer(it.server)
+			}
+			return nil
 		case "d":
 			return a.deleteSelection()
 		case "tab":
@@ -359,33 +485,141 @@ func (a *App) activateSelection() tea.Cmd {
 		return nil
 	}
 
+	return a.startConnect(it.server)
+}
+
+// startConnect tears down whatever is running and dials srv.
+func (a *App) startConnect(srv model.Server) tea.Cmd {
 	a.teardownSession()
 	cols, rows := a.rightInner()
 	a.gen++
 	a.startTerminal(cols, rows)
-	a.connectedID = it.server.ID
-	a.sessionName = it.server.Title()
-	a.sessionAddr = fmt.Sprintf("%s@%s", it.server.User, it.server.Addr())
-	a.connecting = it.server.Title()
+	a.scrollOff = 0
+	a.failErr = nil
+	a.connectedID = srv.ID
+	a.lastAttempt = srv
+	a.sessionName = srv.Title()
+	a.sessionAddr = fmt.Sprintf("%s@%s", srv.User, srv.Addr())
+	a.connecting = srv.Title()
 	a.rightMode = rightTerminal
 	a.focus = focusSidebar
-	return connect(it.server, a.gen, cols, rows)
+	return connect(a.store, a.hostKeys, srv, a.gen, cols, rows)
 }
 
+// retryConnect re-runs the attempt the error card is about, picking up any edit
+// made in between.
+func (a *App) retryConnect() tea.Cmd {
+	srv := a.lastAttempt
+	for _, s := range a.servers {
+		if s.ID == srv.ID {
+			srv = s
+			break
+		}
+	}
+	if srv.Host == "" {
+		return nil
+	}
+	return a.startConnect(srv)
+}
+
+func (a *App) dismissError() {
+	a.rightMode = rightEmpty
+	a.failErr = nil
+	a.errMsg = ""
+	a.focus = focusSidebar
+}
+
+func (a *App) editServer(srv model.Server) tea.Cmd {
+	if srv.ID == "" {
+		return nil
+	}
+	w, h := a.rightInner()
+	a.form = newFormFor(srv, w, h)
+	a.rightMode = rightForm
+	a.focus = focusForm
+	a.errMsg = ""
+	a.failErr = nil
+	return nil
+}
+
+// deleteSelection asks first. Deleting also removes keys/<id>.pem, which is not
+// something to do on a single keystroke.
 func (a *App) deleteSelection() tea.Cmd {
 	it, ok := a.sidebar.Selected()
 	if !ok || it.connect {
 		return nil
 	}
-	id := it.server.ID
-	store := a.store
-	return func() tea.Msg {
-		if err := store.Remove(id); err != nil {
-			return serversLoadedMsg{err: err}
-		}
-		servers, err := store.Load()
-		return serversLoadedMsg{servers: servers, err: err}
+	srv := it.server
+
+	lines := []string{
+		fmt.Sprintf("Delete %s (%s@%s)?", srv.Title(), srv.User, srv.Addr()),
 	}
+	warn := ""
+	if srv.Auth == model.AuthKey && a.store.OwnsKey(srv.KeyPath) {
+		warn = "Its private key " + srv.KeyPath + " will be deleted too."
+	}
+
+	a.confirm = &confirm{
+		title:  "Delete connection",
+		lines:  lines,
+		warn:   warn,
+		accept: "[enter] delete",
+		onYes:  removeServer(a.store, srv.ID),
+	}
+	a.focus = focusSidebar
+	return nil
+}
+
+// askHostKey turns a trust-on-first-use question into the confirm panel. There
+// is no "connect anyway" for a *changed* key — that case never reaches here,
+// the ssh package refuses it outright.
+func (a *App) askHostKey(p *sshpkg.HostKeyPrompt) tea.Cmd {
+	if a.connecting == "" {
+		// Nothing is waiting on this any more (the connect was superseded).
+		return func() tea.Msg { p.Reject(); return nil }
+	}
+
+	a.confirm = &confirm{
+		title: "Unknown host",
+		lines: []string{
+			p.Addr,
+			strings.ToUpper(strings.TrimPrefix(p.KeyType, "ssh-")) + "  " + p.Fingerprint,
+			"",
+			"This host has not been seen before. Verify the fingerprint",
+			"against the server itself before trusting it.",
+			"Approving stores it in " + a.store.KnownHostsPath() + ".",
+		},
+		accept: "[enter] trust and connect",
+		onYes:  func() tea.Msg { p.Accept(); return hostKeyAnsweredMsg{} },
+		onNo:   func() tea.Msg { p.Reject(); return hostKeyAnsweredMsg{} },
+	}
+	a.focus = focusSidebar
+	return nil
+}
+
+// scrollKey handles the scrollback bindings, reporting whether it consumed the
+// key. Terminals normally eat shift+pgup themselves, and Bubble Tea v1 has no
+// key type for it, so shift+up/down is the binding that actually works here.
+func (a *App) scrollKey(msg tea.KeyMsg) bool {
+	_, rows := a.rightInner()
+	switch msg.String() {
+	case "shift+up":
+		a.scrollBy(scrollStep)
+	case "shift+down":
+		a.scrollBy(-scrollStep)
+	case "shift+pgup":
+		a.scrollBy(maxInt(rows/2, 1))
+	case "shift+pgdown":
+		a.scrollBy(-maxInt(rows/2, 1))
+	default:
+		return false
+	}
+	return true
+}
+
+// scrollBy moves the viewport, clamped to what the scrollback actually holds.
+func (a *App) scrollBy(delta int) {
+	a.scrollOff = clampInt(a.scrollOff+delta, 0, maxScrollOffset(a.emu))
 }
 
 // sendKey pushes a key into the emulator, which encodes it and writes the bytes
@@ -404,6 +638,9 @@ func (a *App) sendKey(msg tea.KeyMsg) {
 }
 
 func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
+	if a.wheelOverTerminal(msg) {
+		return nil
+	}
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
 		if a.focus == focusSidebar {
 			return a.sidebar.Update(msg)
@@ -438,6 +675,37 @@ func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+// wheelOverTerminal scrolls the session panel, reporting whether it consumed
+// the event.
+//
+// On the alternate screen (vim, less) the wheel becomes arrow keys instead:
+// vt's scrollback belongs to the main screen, so scrolling it there would show
+// unrelated history. That arrow translation is what a real terminal does for
+// full-screen apps that have not enabled mouse reporting.
+func (a *App) wheelOverTerminal(msg tea.MouseMsg) bool {
+	up := msg.Button == tea.MouseButtonWheelUp
+	if !up && msg.Button != tea.MouseButtonWheelDown {
+		return false
+	}
+	if a.confirm != nil || a.rightMode != rightTerminal || a.emu == nil {
+		return false
+	}
+	if msg.X < sidebarWidth || a.connecting != "" {
+		return false
+	}
+
+	if a.emu.IsAltScreen() {
+		altScreenScroll(a.emu, up)
+		return true
+	}
+	if up {
+		a.scrollBy(scrollStep)
+	} else {
+		a.scrollBy(-scrollStep)
+	}
+	return true
 }
 
 // listHeaderRows is how far the first list item sits below the top of the
@@ -478,6 +746,10 @@ func (a *App) resize(width, height int) tea.Cmd {
 	a.sidebar.SetSize(sidebarWidth-borderSize-2*sidePadX, a.panelHeight())
 	cols, rows := a.rightInner()
 	a.form.setSize(cols-2*padX, rows)
+
+	// Reflowed history no longer lines up with the old offset, so drop back to
+	// the live screen rather than showing a scrambled past.
+	a.scrollOff = 0
 
 	if a.emu != nil {
 		a.emu.Resize(cols, rows)
@@ -608,13 +880,23 @@ func (a *App) rightHeader(cols int) string {
 	switch a.rightMode {
 	case rightForm:
 		title = "New connection"
+		if a.form.editingID != "" {
+			title = "Edit connection"
+		}
 	case rightTerminal:
 		title = a.sessionName
-		if a.connecting != "" {
+		switch {
+		case a.connecting != "":
 			detail = "connecting…"
-		} else {
+		case a.scrollOff > 0:
+			// Say so loudly: the panel is showing the past, not the live screen.
+			detail = fmt.Sprintf("SCROLL −%d", a.scrollOff)
+		default:
 			detail = a.sessionAddr
 		}
+	case rightError:
+		title = "Connection failed"
+		detail = a.lastAttempt.Title()
 	}
 
 	line := strings.Repeat(" ", padX) + styleTitleBar.Render(title)
@@ -625,6 +907,12 @@ func (a *App) rightHeader(cols int) string {
 }
 
 func (a *App) rightBody(cols, rows int) string {
+	// A confirmation replaces the body outright — see confirm.go for why it is
+	// not drawn as an overlay.
+	if a.confirm != nil {
+		return inset(a.confirm.View())
+	}
+
 	switch a.rightMode {
 	case rightForm:
 		return inset(a.form.View())
@@ -633,13 +921,16 @@ func (a *App) rightBody(cols, rows int) string {
 		if a.connecting != "" {
 			return inset(fmt.Sprintf("connecting to %s…", a.connecting))
 		}
-		return renderEmulator(a.emu, cols, rows, a.focus == focusSession)
+		return renderScrolled(a.emu, cols, rows, a.scrollOff, a.focus == focusSession && a.scrollOff == 0)
+
+	case rightError:
+		return inset(errorCard(a.failErr, a.lastAttempt))
 
 	default:
 		var b strings.Builder
 		b.WriteString("Pick a server on the left to open a session,\n")
 		b.WriteString("or choose “+ Connect” to register a new one.\n\n")
-		b.WriteString(styleHint.Render("↑/↓ move · enter select · d delete · q quit"))
+		b.WriteString(styleHint.Render("↑/↓ move · enter select · e edit · d delete · q quit"))
 		if a.errMsg != "" {
 			b.WriteString("\n\n")
 			b.WriteString(styleError.Render("✗ " + a.errMsg))

@@ -16,10 +16,13 @@ import (
 )
 
 const (
-	appDir      = "ssh-client"
-	serversFile = "servers.json"
-	keysDir     = "keys"
-	warnFile    = ".plaintext-warning-ack"
+	appDir          = "ssh-client"
+	serversFile     = "servers.json"
+	keysDir         = "keys"
+	knownHostsFile  = "known_hosts"
+	warnFile        = ".plaintext-warning-ack"
+	userKnownHosts  = ".ssh/known_hosts"
+	knownHostsPerms = 0o600
 )
 
 // Store is the on-disk server list.
@@ -54,6 +57,53 @@ func (s *Store) Path() string { return filepath.Join(s.dir, serversFile) }
 
 // KeysDir is the directory private keys are written to.
 func (s *Store) KeysDir() string { return filepath.Join(s.dir, keysDir) }
+
+// KnownHostsPath is the only known_hosts file we ever write to. The user's
+// OpenSSH file is read but never modified — it belongs to their other tools.
+func (s *Store) KnownHostsPath() string { return filepath.Join(s.dir, knownHostsFile) }
+
+// KnownHostsFiles lists the known_hosts files to verify against, most-specific
+// last. Missing files are skipped: knownhosts.New fails on a path that does not
+// exist, and a fresh install has neither.
+func (s *Store) KnownHostsFiles() []string {
+	var paths []string
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, filepath.FromSlash(userKnownHosts)))
+	}
+	paths = append(paths, s.KnownHostsPath())
+
+	existing := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			existing = append(existing, p)
+		}
+	}
+	return existing
+}
+
+// AppendKnownHost adds one known_hosts line to our own file, creating it 0600.
+func (s *Store) AppendKnownHost(line string) error {
+	if strings.TrimSpace(line) == "" {
+		return errors.New("empty known_hosts line")
+	}
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", s.dir, err)
+	}
+	path := s.KnownHostsPath()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, knownHostsPerms)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	if !strings.HasSuffix(line, "\n") {
+		line += "\n"
+	}
+	if _, err := f.WriteString(line); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
 
 // Load reads the server list. A missing file is an empty list, not an error.
 func (s *Store) Load() ([]model.Server, error) {
@@ -118,19 +168,74 @@ func (s *Store) Add(srv model.Server) (model.Server, error) {
 	return srv, nil
 }
 
-// Remove deletes the entry with the given ID.
+// Update replaces the entry with the same ID, keeping its position in the list.
+func (s *Store) Update(srv model.Server) error {
+	if srv.ID == "" {
+		return errors.New("cannot update a server without an ID")
+	}
+	if srv.Port == 0 {
+		srv.Port = model.DefaultPort
+	}
+	servers, err := s.Load()
+	if err != nil {
+		return err
+	}
+	for i := range servers {
+		if servers[i].ID == srv.ID {
+			servers[i] = srv
+			return s.Save(servers)
+		}
+	}
+	return fmt.Errorf("no server with id %q", srv.ID)
+}
+
+// Remove deletes the entry with the given ID, along with the private key we
+// generated for it. A key the user pointed us at (~/.ssh/id_ed25519) is theirs,
+// not ours, so only paths inside KeysDir are deleted.
 func (s *Store) Remove(id string) error {
 	servers, err := s.Load()
 	if err != nil {
 		return err
 	}
+	var removed *model.Server
 	kept := servers[:0]
 	for _, srv := range servers {
-		if srv.ID != id {
-			kept = append(kept, srv)
+		if srv.ID == id {
+			removed = &srv
+			continue
+		}
+		kept = append(kept, srv)
+	}
+	if err := s.Save(kept); err != nil {
+		return err
+	}
+	if removed != nil && s.OwnsKey(removed.KeyPath) {
+		if err := os.Remove(removed.KeyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove %s: %w", removed.KeyPath, err)
 		}
 	}
-	return s.Save(kept)
+	return nil
+}
+
+// OwnsKey reports whether path is a file we wrote into KeysDir. Anything
+// outside it — or reaching outside it via ".." — is not ours to delete.
+func (s *Store) OwnsKey(path string) bool {
+	if path == "" {
+		return false
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	dir, err := filepath.Abs(s.KeysDir())
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(dir, abs)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // SaveKey writes a pasted private key body to keys/<id>.pem with 0600

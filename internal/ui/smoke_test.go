@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/pyjhoop/ssh-client/internal/config"
 	"github.com/pyjhoop/ssh-client/internal/model"
+	sshpkg "github.com/pyjhoop/ssh-client/internal/ssh"
 )
 
 // smoke drives the root model without a terminal: layout, focus switching and
@@ -320,6 +322,354 @@ func TestKeyToVTCoversControlAndSpecialKeys(t *testing.T) {
 	for _, c := range cases {
 		if _, ok := keyToVT(c); !ok {
 			t.Errorf("keyToVT(%v) reported no mapping", c)
+		}
+	}
+}
+
+// TestScrollbackRendersHistory checks the scrolled viewport: the top rows come
+// from the vt scrollback, the rest from the live screen, and the block is still
+// exactly rows × cols.
+func TestScrollbackRendersHistory(t *testing.T) {
+	const cols, rows = 40, 10
+	emu := newEmulator(cols, rows)
+
+	for i := range 200 {
+		fmt.Fprintf(emu, "line %d\r\n", i)
+	}
+	if emu.ScrollbackLen() == 0 {
+		t.Fatal("nothing was pushed into the scrollback")
+	}
+
+	const offset = 4
+	out := renderScrolled(emu, cols, rows, offset, false)
+	lines := strings.Split(out, "\n")
+	if len(lines) != rows {
+		t.Fatalf("rendered %d lines, want %d", len(lines), rows)
+	}
+	for i, l := range lines {
+		if w := ansi.StringWidth(l); w != cols {
+			t.Errorf("row %d is %d columns wide, want %d", i, w, cols)
+		}
+	}
+
+	// The first visible row is the line offset positions back from the top of
+	// the live screen.
+	sb := emu.Scrollback()
+	wantFirst := strings.TrimSpace(stripANSI(sb.Line(sb.Len() - offset).Render()))
+	if got := strings.TrimSpace(stripANSI(lines[0])); got != wantFirst {
+		t.Errorf("first row: got %q, want the scrollback line %q", got, wantFirst)
+	}
+
+	// And row `offset` is what used to be the top of the screen.
+	screenTop := strings.TrimSpace(stripANSI(strings.Split(emu.Render(), "\n")[0]))
+	if got := strings.TrimSpace(stripANSI(lines[offset])); got != screenTop {
+		t.Errorf("row %d: got %q, want the screen's first row %q", offset, got, screenTop)
+	}
+
+	// offset 0 must be identical to the unscrolled render.
+	if renderScrolled(emu, cols, rows, 0, false) != renderEmulator(emu, cols, rows, false) {
+		t.Error("offset 0 should take the plain render path")
+	}
+}
+
+// TestScrollOffsetClampsAndResets covers the state rules around scrolling: it
+// never runs past the buffer, any key drops back to the bottom, and a resize
+// clears it because the reflowed history no longer matches.
+func TestScrollOffsetClampsAndResets(t *testing.T) {
+	app := New(config.New(t.TempDir()))
+	app.resize(100, 24)
+	cols, rows := app.rightInner()
+	app.emu = newEmulator(cols, rows)
+	app.rightMode = rightTerminal
+	app.focus = focusSession
+
+	for i := range 100 {
+		fmt.Fprintf(app.emu, "line %d\r\n", i)
+	}
+
+	app.scrollBy(1000)
+	if app.scrollOff != app.emu.ScrollbackLen() {
+		t.Errorf("scroll offset %d should clamp to the scrollback length %d", app.scrollOff, app.emu.ScrollbackLen())
+	}
+	app.scrollBy(-10000)
+	if app.scrollOff != 0 {
+		t.Errorf("scroll offset %d should clamp to 0", app.scrollOff)
+	}
+
+	// The title bar has to say we are looking at the past.
+	app.scrollBy(5)
+	if got := stripANSI(app.rightHeader(cols)); !strings.Contains(got, "SCROLL −5") {
+		t.Errorf("header should announce the scroll offset, got %q", got)
+	}
+	_ = rows
+
+	// shift+up scrolls without reaching the session; a plain key returns to the
+	// bottom.
+	before := app.scrollOff
+	app.handleKey(tea.KeyMsg{Type: tea.KeyShiftUp})
+	if app.scrollOff != before+scrollStep {
+		t.Errorf("shift+up: offset %d, want %d", app.scrollOff, before+scrollStep)
+	}
+	app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if app.scrollOff != 0 {
+		t.Errorf("any other key should jump back to the bottom, offset is %d", app.scrollOff)
+	}
+
+	app.scrollBy(5)
+	app.resize(120, 30)
+	if app.scrollOff != 0 {
+		t.Errorf("resize should reset the scroll offset, got %d", app.scrollOff)
+	}
+}
+
+// TestConfirmPanelSwallowsKeys is the containment property: while a confirm is
+// up, nothing reaches the session or the list behind it.
+func TestConfirmPanelSwallowsKeys(t *testing.T) {
+	app := New(config.New(t.TempDir()))
+	app.resize(100, 24)
+	app.rightMode = rightTerminal
+	app.focus = focusSession
+	app.emu = newEmulator(app.rightInner())
+
+	answered := 0
+	app.confirm = &confirm{
+		title:  "Delete connection",
+		lines:  []string{"Delete alpha?"},
+		accept: "[enter] delete",
+		onYes:  func() tea.Msg { answered++; return nil },
+	}
+
+	// Unrelated keys are dropped, not forwarded.
+	for _, k := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune("x")},
+		{Type: tea.KeyUp},
+		{Type: tea.KeyCtrlB},
+	} {
+		if cmd := app.handleKey(k); cmd != nil {
+			t.Errorf("%v produced a command while a confirm was up", k)
+		}
+		if app.confirm == nil {
+			t.Fatalf("%v dismissed the confirm", k)
+		}
+		if app.focus != focusSession {
+			t.Errorf("%v changed focus to %v", k, app.focus)
+		}
+	}
+
+	// The panel body is the confirmation, not the terminal.
+	cols, rows := app.rightInner()
+	if got := stripANSI(app.rightBody(cols, rows)); !strings.Contains(got, "Delete alpha?") {
+		t.Errorf("confirm should replace the panel body, got %q", got)
+	}
+
+	if cmd := app.handleKey(tea.KeyMsg{Type: tea.KeyEnter}); cmd == nil {
+		t.Fatal("enter should run onYes")
+	} else {
+		cmd()
+	}
+	if answered != 1 {
+		t.Errorf("onYes ran %d times, want 1", answered)
+	}
+	if app.confirm != nil {
+		t.Error("answering should dismiss the confirm")
+	}
+}
+
+// TestEditFormPrefills round-trips a server through the edit form.
+func TestEditFormPrefills(t *testing.T) {
+	srv := model.Server{
+		ID: "abc", Name: "prod-web", Host: "10.0.0.1", Port: 2222,
+		User: "deploy", Auth: model.AuthPassword, Password: "hunter2",
+	}
+
+	f := newFormFor(srv, 60, 20)
+	if f.editingID != srv.ID {
+		t.Errorf("editingID: got %q, want %q", f.editingID, srv.ID)
+	}
+
+	got, keyBody, err := f.Server()
+	if err != nil {
+		t.Fatalf("form.Server: %v", err)
+	}
+	if keyBody != "" {
+		t.Errorf("nothing was pasted, got key body %q", keyBody)
+	}
+	if got != srv {
+		t.Errorf("round trip: got %+v, want %+v", got, srv)
+	}
+
+	// Key auth keeps the stored path and leaves the paste area empty, so saving
+	// without pasting keeps the existing keys/<id>.pem.
+	keySrv := model.Server{ID: "def", Host: "h", Port: 22, User: "u", Auth: model.AuthKey, KeyPath: "/tmp/keys/def.pem"}
+	kf := newFormFor(keySrv, 60, 20)
+	gotKey, body, err := kf.Server()
+	if err != nil {
+		t.Fatalf("form.Server: %v", err)
+	}
+	if body != "" {
+		t.Errorf("the key body must start empty, got %q", body)
+	}
+	if gotKey != keySrv {
+		t.Errorf("round trip: got %+v, want %+v", gotKey, keySrv)
+	}
+}
+
+// TestEditKeyOpensThePrefilledForm walks the sidebar binding end to end.
+func TestEditKeyOpensThePrefilledForm(t *testing.T) {
+	app := New(config.New(t.TempDir()))
+	app.servers = []model.Server{{ID: "1", Name: "alpha", Host: "a", Port: 22, User: "u", Auth: model.AuthPassword, Password: "p"}}
+	app.sidebar.SetServers(app.servers)
+	app.resize(100, 24)
+
+	// Row 0 is "+ Connect", which has nothing to edit.
+	app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	if app.rightMode == rightForm {
+		t.Fatal("e on “+ Connect” should do nothing")
+	}
+
+	app.sidebar.list.Select(1)
+	app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	if app.rightMode != rightForm || app.focus != focusForm {
+		t.Fatalf("e should open the form, got rightMode=%v focus=%v", app.rightMode, app.focus)
+	}
+	if app.form.editingID != "1" {
+		t.Errorf("editingID: got %q, want %q", app.form.editingID, "1")
+	}
+	if got := stripANSI(app.rightHeader(80)); !strings.Contains(got, "Edit connection") {
+		t.Errorf("header: got %q, want it to say Edit connection", got)
+	}
+}
+
+// TestDeleteAsksFirst: d must not delete on its own any more.
+func TestDeleteAsksFirst(t *testing.T) {
+	store := config.New(t.TempDir())
+	saved, err := store.Add(model.Server{Name: "alpha", Host: "a", Port: 22, User: "u", Auth: model.AuthPassword, Password: "p"})
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	app := New(store)
+	app.servers = []model.Server{saved}
+	app.sidebar.SetServers(app.servers)
+	app.resize(100, 24)
+	app.sidebar.list.Select(1)
+
+	if cmd := app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")}); cmd != nil {
+		t.Fatal("d should only raise a confirmation, not act")
+	}
+	if app.confirm == nil {
+		t.Fatal("d should raise a confirmation")
+	}
+
+	// Cancelling leaves the entry alone.
+	app.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if left, _ := store.Load(); len(left) != 1 {
+		t.Fatalf("cancelling deleted the entry anyway, %d left", len(left))
+	}
+
+	app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	cmd := app.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("confirming should produce the removal command")
+	}
+	cmd()
+	if left, _ := store.Load(); len(left) != 0 {
+		t.Fatalf("confirming did not delete the entry, %d left", len(left))
+	}
+}
+
+// TestErrorCardOffersActions checks the typed-error path all the way to the
+// panel: the advice comes from errors.Is, never from message text.
+func TestErrorCardOffersActions(t *testing.T) {
+	app := New(config.New(t.TempDir()))
+	app.resize(100, 24)
+	srv := model.Server{ID: "1", Name: "prod-web", Host: "10.0.0.1", Port: 22, User: "deploy", Auth: model.AuthPassword, Password: "p"}
+	app.servers = []model.Server{srv}
+	app.sidebar.SetServers(app.servers)
+	app.lastAttempt = srv
+	app.gen = 7
+
+	var m tea.Model = app
+	m, _ = m.Update(connectFailedMsg{gen: 7, err: fmt.Errorf("%w: whatever the server said", sshpkg.ErrAuth)})
+	if app.rightMode != rightError {
+		t.Fatalf("a failed connect should show the error card, rightMode=%v", app.rightMode)
+	}
+
+	cols, rows := app.rightInner()
+	body := stripANSI(app.rightBody(cols, rows))
+	for _, want := range []string{"authentication failed", "deploy@10.0.0.1:22", "[e] edit connection"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("error card is missing %q; body is:\n%s", want, body)
+		}
+	}
+	if got := stripANSI(app.rightHeader(cols)); !strings.Contains(got, "Connection failed") {
+		t.Errorf("header: got %q", got)
+	}
+
+	// A mismatched host key gets no retry: retrying is not the fix.
+	_, _, actions := errorAdvice(fmt.Errorf("%w: x", sshpkg.ErrHostKeyMismatch), srv)
+	for _, a := range actions {
+		if strings.Contains(a, "[r]") {
+			t.Errorf("host key mismatch must not offer retry, got %v", actions)
+		}
+	}
+
+	// e opens the edit form for the server that failed.
+	app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	if app.rightMode != rightForm || app.form.editingID != "1" {
+		t.Fatalf("e should edit the failed server, rightMode=%v editingID=%q", app.rightMode, app.form.editingID)
+	}
+
+	// esc dismisses.
+	app.rightMode = rightError
+	app.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if app.rightMode != rightEmpty {
+		t.Errorf("esc should dismiss the card, rightMode=%v", app.rightMode)
+	}
+}
+
+// TestLayoutAlignmentWithPanels re-runs the geometry check in the two states v1
+// adds, since both replace the right panel's body.
+func TestLayoutAlignmentWithPanels(t *testing.T) {
+	states := map[string]func(*App){
+		"confirm": func(a *App) {
+			a.confirm = &confirm{
+				title:  "Unknown host",
+				lines:  []string{"10.0.0.1:22", "ED25519  SHA256:abcdefghijklmnopqrstuvwxyz0123456789+/AAA"},
+				warn:   "Verify this fingerprint against the server itself.",
+				accept: "[enter] trust and connect",
+			}
+		},
+		"error card": func(a *App) {
+			a.rightMode = rightError
+			a.lastAttempt = model.Server{ID: "1", Name: "prod-web", Host: "10.0.0.1", Port: 22, User: "deploy"}
+			a.failErr = fmt.Errorf("%w: nope", sshpkg.ErrHostKeyMismatch)
+		},
+	}
+
+	for name, setup := range states {
+		for _, size := range [][2]int{{100, 24}, {80, 30}, {200, 60}, {40, 10}} {
+			width, height := size[0], size[1]
+
+			app := New(config.New(t.TempDir()))
+			app.servers = []model.Server{{ID: "1", Name: "alpha", Host: "a", User: "u", Port: 22}}
+			app.sidebar.SetServers(app.servers)
+			app.resize(width, height)
+			setup(app)
+
+			lines := strings.Split(app.View(), "\n")
+			if len(lines) != height {
+				t.Errorf("%s %dx%d: rendered %d rows, want %d", name, width, height, len(lines), height)
+				continue
+			}
+			for i, l := range lines {
+				if w := ansi.StringWidth(l); w != width {
+					t.Errorf("%s %dx%d: row %d is %d columns wide, want %d", name, width, height, i, w, width)
+				}
+			}
+			if bottom := lines[height-statusRows-1]; strings.Count(stripANSI(bottom), "╰") != 2 {
+				t.Errorf("%s %dx%d: panels do not close on the same row: %q", name, width, height, stripANSI(bottom))
+			}
 		}
 	}
 }

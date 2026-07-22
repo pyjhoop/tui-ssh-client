@@ -34,27 +34,44 @@ type Session struct {
 	mu      sync.Mutex
 	exitErr error
 	closed  bool
+	// Last geometry we sent, so a drag-resize storm does not turn into one
+	// window-change request per pixel.
+	sentCols, sentRows int
 }
 
-// Connect dials the server and starts an interactive shell on a PTY of the
-// given size. It blocks, so callers must run it off the UI goroutine.
-func Connect(srv model.Server, cols, rows int) (*Session, error) {
+// Dial opens an authenticated client connection, verifying the host key against
+// opts. It is the single entry point to the network: Connect builds a shell on
+// top of it, and v2's SFTP support will reuse it as-is.
+func Dial(srv model.Server, opts Options) (*xssh.Client, error) {
 	auth, err := authMethods(srv)
+	if err != nil {
+		return nil, err
+	}
+	hostKey, err := opts.hostKeyCallback()
 	if err != nil {
 		return nil, err
 	}
 
 	cfg := &xssh.ClientConfig{
-		User:    srv.User,
-		Auth:    auth,
-		Timeout: DialTimeout,
-		// v0 does not verify host keys; known_hosts support is a v1 item.
-		HostKeyCallback: xssh.InsecureIgnoreHostKey(), //nolint:gosec
+		User:            srv.User,
+		Auth:            auth,
+		Timeout:         DialTimeout,
+		HostKeyCallback: hostKey,
 	}
 
 	client, err := xssh.Dial("tcp", srv.Addr(), cfg)
 	if err != nil {
-		return nil, fmt.Errorf("connect to %s: %w", srv.Addr(), err)
+		return nil, classify(fmt.Errorf("connect to %s: %w", srv.Addr(), err))
+	}
+	return client, nil
+}
+
+// Connect dials the server and starts an interactive shell on a PTY of the
+// given size. It blocks, so callers must run it off the UI goroutine.
+func Connect(srv model.Server, cols, rows int, opts Options) (*Session, error) {
+	client, err := Dial(srv, opts)
+	if err != nil {
+		return nil, err
 	}
 
 	sess, err := client.NewSession()
@@ -108,10 +125,12 @@ func Connect(srv model.Server, cols, rows int) (*Session, error) {
 	}
 
 	s := &Session{
-		client: client,
-		sess:   sess,
-		stdin:  stdin,
-		out:    make(chan []byte, 64),
+		client:   client,
+		sess:     sess,
+		stdin:    stdin,
+		out:      make(chan []byte, 64),
+		sentCols: cols,
+		sentRows: rows,
 	}
 
 	var pumps sync.WaitGroup
@@ -154,15 +173,21 @@ func (s *Session) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// Resize tells the remote about the new PTY geometry.
+// Resize tells the remote about the new PTY geometry. Sizes it has already
+// been told are dropped: dragging a window edge produces a burst of identical
+// WindowSizeMsgs, and each request is a round trip.
 func (s *Session) Resize(cols, rows int) error {
 	if cols < 1 || rows < 1 {
 		return nil
 	}
 	s.mu.Lock()
 	closed := s.closed
+	unchanged := s.sentCols == cols && s.sentRows == rows
+	if !closed && !unchanged {
+		s.sentCols, s.sentRows = cols, rows
+	}
 	s.mu.Unlock()
-	if closed {
+	if closed || unchanged {
 		return nil
 	}
 	if err := s.sess.WindowChange(rows, cols); err != nil {
@@ -254,20 +279,20 @@ func authMethods(srv model.Server) ([]xssh.AuthMethod, error) {
 	case model.AuthKey:
 		pem, err := os.ReadFile(srv.KeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("read key %s: %w", srv.KeyPath, err)
+			return nil, fmt.Errorf("%w: read key %s: %w", ErrKeyFile, srv.KeyPath, err)
 		}
 		signer, err := xssh.ParsePrivateKey(pem)
 		if err != nil {
 			var passErr *xssh.PassphraseMissingError
 			if errors.As(err, &passErr) {
-				return nil, fmt.Errorf("key %s is passphrase-protected (not supported in v0)", srv.KeyPath)
+				return nil, fmt.Errorf("%w: key %s is passphrase-protected (not supported yet)", ErrKeyFile, srv.KeyPath)
 			}
-			return nil, fmt.Errorf("parse key %s: %w", srv.KeyPath, err)
+			return nil, fmt.Errorf("%w: parse key %s: %w", ErrKeyFile, srv.KeyPath, err)
 		}
 		return []xssh.AuthMethod{xssh.PublicKeys(signer)}, nil
 
 	default:
-		return nil, fmt.Errorf("unknown auth method %q", srv.Auth)
+		return nil, fmt.Errorf("%w: unknown auth method %q", ErrKeyFile, srv.Auth)
 	}
 }
 

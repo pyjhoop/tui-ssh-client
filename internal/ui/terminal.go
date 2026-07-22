@@ -105,6 +105,66 @@ func renderEmulator(emu *vt.Emulator, cols, rows int, showCursor bool) string {
 	return strings.Join(rendered, "\n")
 }
 
+// scrollStep is how far one wheel notch moves the viewport.
+const scrollStep = 3
+
+// renderScrolled draws the terminal with the viewport lifted offset lines into
+// the scrollback. offset == 0 is the live screen and takes the fast path.
+//
+// Visible row i shows scrollback line ScrollbackLen()-offset+i while that index
+// is still in the buffer, and screen row i-offset afterwards. The cursor is not
+// drawn while scrolled: it lives on the live screen, which may not even be on
+// display.
+func renderScrolled(emu *vt.Emulator, cols, rows, offset int, showCursor bool) string {
+	if offset <= 0 || emu == nil {
+		return renderEmulator(emu, cols, rows, showCursor)
+	}
+	if cols < 1 || rows < 1 {
+		return strings.Repeat("\n", maxInt(rows-1, 0))
+	}
+
+	sb := emu.Scrollback()
+	offset = clampInt(offset, 0, sb.Len())
+	screen := strings.Split(emu.Render(), "\n")
+
+	out := make([]string, rows)
+	for i := range out {
+		var line string
+		switch {
+		case i < offset:
+			// Scrollback lines are stored trimmed of trailing blanks, so a nil
+			// line here is simply an empty one.
+			line = sb.Line(sb.Len() - offset + i).Render()
+		case i-offset < len(screen):
+			line = screen[i-offset]
+		}
+		out[i] = padLine(line, cols)
+	}
+	return strings.Join(out, "\n")
+}
+
+// maxScrollOffset is how far back the viewport may go.
+func maxScrollOffset(emu *vt.Emulator) int {
+	if emu == nil || emu.IsAltScreen() {
+		// The scrollback belongs to the main screen; scrolling an alt-screen app
+		// like vim would show unrelated history.
+		return 0
+	}
+	return emu.ScrollbackLen()
+}
+
+// altScreenScroll converts a wheel notch into cursor keys, which is what a real
+// terminal does for full-screen apps that have not asked for mouse reporting.
+func altScreenScroll(emu *vt.Emulator, up bool) {
+	code := uv.KeyDown
+	if up {
+		code = uv.KeyUp
+	}
+	for range scrollStep {
+		emu.SendKey(vt.KeyPressEvent{Code: code})
+	}
+}
+
 // highlightCursor flips the cursor cell to reverse video and returns a func
 // that puts the original cell back. The emulator is the single owner of screen
 // state, so we mutate and restore rather than keeping a shadow copy.
@@ -261,4 +321,14 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
