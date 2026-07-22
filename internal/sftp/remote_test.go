@@ -1,6 +1,7 @@
 package sftp_test
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
@@ -66,7 +67,7 @@ func TestRemoteRoundTrip(t *testing.T) {
 	if _, ok, err := r.Stat(dst); err != nil || ok {
 		t.Fatalf("Stat before upload: ok=%v err=%v, want (false, nil)", ok, err)
 	}
-	n, err := sftppkg.Upload(r, src, dst)
+	n, err := sftppkg.Upload(context.Background(), r, src, dst, nil)
 	if err != nil {
 		t.Fatalf("Upload: %v", err)
 	}
@@ -86,7 +87,7 @@ func TestRemoteRoundTrip(t *testing.T) {
 	if _, ok, err := sftppkg.StatLocal(localDst); err != nil || ok {
 		t.Fatalf("StatLocal before download: ok=%v err=%v", ok, err)
 	}
-	if _, err := sftppkg.Download(r, path.Join(remoteDir, "down.txt"), localDst); err != nil {
+	if _, err := sftppkg.Download(context.Background(), r, path.Join(remoteDir, "down.txt"), localDst, nil); err != nil {
 		t.Fatalf("Download: %v", err)
 	}
 	if got := mustRead(t, localDst); got != "downloaded body" {
@@ -96,20 +97,118 @@ func TestRemoteRoundTrip(t *testing.T) {
 		t.Errorf("StatLocal after download: ok=%v err=%v", ok, err)
 	}
 
-	// ── directories are refused, in both directions ─────────────────────────
-	if _, err := sftppkg.Upload(r, filepath.Join(localDir, "sub"), path.Join(remoteDir, "sub")); err == nil {
+	// ── the single-file API still refuses a directory in both directions ────
+	// It is an internal mistake now rather than something the user can reach:
+	// RunSet is what recurses.
+	if _, err := sftppkg.Upload(context.Background(), r, filepath.Join(localDir, "sub"), path.Join(remoteDir, "sub"), nil); err == nil {
 		t.Error("uploading a missing path should fail")
 	}
 	if err := os.Mkdir(filepath.Join(localDir, "sub"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	_, err = sftppkg.Upload(r, filepath.Join(localDir, "sub"), path.Join(remoteDir, "sub"))
+	_, err = sftppkg.Upload(context.Background(), r, filepath.Join(localDir, "sub"), path.Join(remoteDir, "sub"), nil)
 	if !errors.Is(err, sftppkg.ErrIsDir) {
 		t.Errorf("Upload of a directory: got %v, want ErrIsDir", err)
 	}
-	_, err = sftppkg.Download(r, path.Join(remoteDir, "adir"), filepath.Join(localDir, "adir"))
+	_, err = sftppkg.Download(context.Background(), r, path.Join(remoteDir, "adir"), filepath.Join(localDir, "adir"), nil)
 	if !errors.Is(err, sftppkg.ErrIsDir) {
 		t.Errorf("Download of a directory: got %v, want ErrIsDir", err)
+	}
+}
+
+// TestRemoteRecursiveRoundTrip is the v3 promise against a live server: a whole
+// tree goes up, comes back down, and matches.
+func TestRemoteRecursiveRoundTrip(t *testing.T) {
+	srv := startSFTPServer(t)
+	r, err := sftppkg.Connect(srv.server(), srv.trusted(t))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer r.Close()
+
+	localDir := t.TempDir()
+	remoteDir := t.TempDir()
+
+	// proj/{main.go, pkg/{a.go, b.go}, empty/}
+	tree := filepath.Join(localDir, "proj")
+	mkdirs(t, tree, filepath.Join(tree, "pkg"), filepath.Join(tree, "empty"))
+	mustWrite(t, filepath.Join(tree, "main.go"), "package main")
+	mustWrite(t, filepath.Join(tree, "pkg", "a.go"), "aaa")
+	mustWrite(t, filepath.Join(tree, "pkg", "b.go"), "bbbb")
+
+	items, total, skipped, err := sftppkg.Plan(sftppkg.Local{}, tree)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if want := int64(len("package main") + 3 + 4); total != want {
+		t.Errorf("Plan total = %d, want %d", total, want)
+	}
+	if skipped != 0 {
+		t.Errorf("Plan skipped %d, want 0", skipped)
+	}
+
+	up := sftppkg.Set{
+		Upload:  true,
+		SrcRoot: tree,
+		DstRoot: path.Join(remoteDir, "proj"),
+		Items:   items,
+	}
+	res, err := sftppkg.RunSet(context.Background(), r, up, nil)
+	if err != nil {
+		t.Fatalf("RunSet upload: %v", err)
+	}
+	if res.Files != 3 || res.Bytes != total {
+		t.Errorf("upload result %+v, want 3 files and %d bytes", res, total)
+	}
+	if got := mustRead(t, path.Join(remoteDir, "proj", "pkg", "b.go")); got != "bbbb" {
+		t.Errorf("uploaded pkg/b.go: got %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(remoteDir, "proj", "empty")); err != nil {
+		t.Errorf("the empty directory did not make it across: %v", err)
+	}
+
+	// ── and back down ───────────────────────────────────────────────────────
+	downItems, _, _, err := sftppkg.Plan(r, path.Join(remoteDir, "proj"))
+	if err != nil {
+		t.Fatalf("Plan remote: %v", err)
+	}
+	back := filepath.Join(localDir, "back")
+	if _, err := sftppkg.RunSet(context.Background(), r, sftppkg.Set{
+		SrcRoot: path.Join(remoteDir, "proj"),
+		DstRoot: back,
+		Items:   downItems,
+	}, nil); err != nil {
+		t.Fatalf("RunSet download: %v", err)
+	}
+	if got := mustRead(t, filepath.Join(back, "pkg", "a.go")); got != "aaa" {
+		t.Errorf("downloaded pkg/a.go: got %q", got)
+	}
+
+	// ── rename and recursive remove ─────────────────────────────────────────
+	if err := r.Rename(path.Join(remoteDir, "proj", "main.go"), path.Join(remoteDir, "proj", "renamed.go")); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if _, ok, _ := r.Stat(path.Join(remoteDir, "proj", "renamed.go")); !ok {
+		t.Error("the renamed file is not there")
+	}
+
+	if err := r.Remove(path.Join(remoteDir, "proj"), false); err == nil {
+		t.Error("a non-recursive remove of a non-empty directory should fail")
+	}
+	if err := r.Remove(path.Join(remoteDir, "proj"), true); err != nil {
+		t.Fatalf("recursive Remove: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(remoteDir, "proj")); !os.IsNotExist(err) {
+		t.Errorf("the tree is still there: %v", err)
+	}
+}
+
+func mkdirs(t *testing.T, dirs ...string) {
+	t.Helper()
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
 	}
 }
 

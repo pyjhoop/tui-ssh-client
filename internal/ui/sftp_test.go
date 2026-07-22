@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -19,8 +20,10 @@ import (
 // fakeBrowser stands in for a remote: the UI tests are about geometry and state
 // transitions, and neither needs a live connection.
 type fakeBrowser struct {
-	label string
-	dirs  map[string][]model.FileEntry
+	label   string
+	dirs    map[string][]model.FileEntry
+	removed []string
+	renamed [2]string
 }
 
 func (f *fakeBrowser) Label() string                { return f.label }
@@ -38,6 +41,31 @@ func (f *fakeBrowser) Parent(dir string) string {
 func (f *fakeBrowser) Home() (string, error) { return "/home", nil }
 func (f *fakeBrowser) List(dir string) ([]model.FileEntry, error) {
 	return f.dirs[dir], nil
+}
+
+// Stat answers from the same map List reads, so Plan walks the fake tree the
+// way it would walk a real one.
+func (f *fakeBrowser) Stat(p string) (model.FileEntry, bool, error) {
+	name := p[strings.LastIndex(p, "/")+1:]
+	if _, ok := f.dirs[p]; ok {
+		return model.FileEntry{Name: name, IsDir: true}, true, nil
+	}
+	for _, e := range f.dirs[f.Parent(p)] {
+		if e.Name == name {
+			return e, true, nil
+		}
+	}
+	return model.FileEntry{}, false, nil
+}
+
+func (f *fakeBrowser) Remove(p string, recursive bool) error {
+	f.removed = append(f.removed, p)
+	return nil
+}
+
+func (f *fakeBrowser) Rename(oldPath, newPath string) error {
+	f.renamed = [2]string{oldPath, newPath}
+	return nil
 }
 
 // sftpApp builds a root model already in the split view, with both panes filled
@@ -73,6 +101,31 @@ func sftpApp(t *testing.T, width, height int) *App {
 	app.local.setEntries("/home", localFiles)
 	app.remotePane.setEntries("/srv", remoteFiles)
 	return app
+}
+
+// settle runs a command and feeds its message back, which is what the runtime
+// does. v3 puts a walk between "the user asked" and "the panel appears", so the
+// tests have to take that step too.
+func settle(t *testing.T, app *App, cmd tea.Cmd) {
+	t.Helper()
+	for range 4 {
+		if cmd == nil {
+			return
+		}
+		msg := cmd()
+		if msg == nil {
+			return
+		}
+		var m tea.Model = app
+		_, cmd = m.Update(msg)
+	}
+}
+
+// askTransfer is buildTransfer plus the walk, i.e. everything up to the
+// confirmation panel appearing.
+func askTransfer(t *testing.T, app *App, from focusArea, entries ...model.FileEntry) {
+	t.Helper()
+	settle(t, app, app.buildTransfer(from, entries))
 }
 
 // TestSFTPLayoutAlignment is TestLayoutAlignment for the three-panel view: the
@@ -112,7 +165,7 @@ func TestSFTPModalFloatsOverThePanes(t *testing.T) {
 		app := sftpApp(t, width, height)
 		app.local.cursor = 2 // main.go
 		app.remote = &sftppkg.Remote{}
-		app.buildTransfer(focusLocal, model.FileEntry{Name: "main.go", Size: 1234})
+		askTransfer(t, app, focusLocal, model.FileEntry{Name: "main.go", Size: 1234})
 		if app.pending == nil {
 			t.Fatalf("%dx%d: buildTransfer produced no pending transfer", width, height)
 		}
@@ -165,7 +218,7 @@ func TestSFTPModalWithColour(t *testing.T) {
 	app := sftpApp(t, 100, 24)
 	app.remote = &sftppkg.Remote{}
 	app.local.cursor = 2
-	app.buildTransfer(focusLocal, model.FileEntry{Name: "main.go", Size: 1234})
+	askTransfer(t, app, focusLocal, model.FileEntry{Name: "main.go", Size: 1234})
 
 	view := app.View()
 	if !strings.Contains(view, "\x1b[") {
@@ -348,12 +401,13 @@ func TestDragDropRequestsConfirmation(t *testing.T) {
 		app.handleMouse(tea.MouseMsg{X: x, Y: y, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
 	}
 	// Release deliberately reports no button: several terminals do exactly that.
+	// It returns the walk the drop started, which the runtime would run.
 	release := func(x, y int) {
-		app.handleMouse(tea.MouseMsg{X: x, Y: y, Action: tea.MouseActionRelease, Button: tea.MouseButtonNone})
+		settle(t, app, app.handleMouse(tea.MouseMsg{X: x, Y: y, Action: tea.MouseActionRelease, Button: tea.MouseButtonNone}))
 	}
 
 	press(localX, fileRow)
-	if app.drag == nil || app.drag.entry.Name != "main.go" {
+	if app.drag == nil || len(app.drag.entries) != 1 || app.drag.entries[0].Name != "main.go" {
 		t.Fatalf("press on a file should start a drag, got %+v", app.drag)
 	}
 	if app.focus != focusLocal {
@@ -372,7 +426,7 @@ func TestDragDropRequestsConfirmation(t *testing.T) {
 	if app.pending == nil {
 		t.Fatal("dropping on the other pane should ask for confirmation")
 	}
-	if !app.pending.upload || app.pending.dstPath != "/srv/main.go" || !app.pending.overwrite {
+	if !app.pending.upload || app.pending.dstPath() != "/srv/main.go" || len(app.pending.overwrite) != 1 {
 		t.Errorf("pending: %+v", *app.pending)
 	}
 
@@ -398,14 +452,16 @@ func TestDragDropRequestsConfirmation(t *testing.T) {
 		t.Error("dropping on the sidebar must not transfer")
 	}
 
-	// Directories and ".." are navigation, not cargo.
+	// ".." is navigation and never cargo. A directory is cargo now: v3 copies
+	// recurse, so dragging a folder is the whole point.
 	press(localX, paneBodyTop) // ".."
 	if app.drag != nil {
 		t.Error("“..” must not start a drag")
 	}
+	app.drag = nil
 	press(localX, paneBodyTop+1) // docs/
-	if app.drag != nil {
-		t.Error("a directory must not start a drag")
+	if app.drag == nil || app.drag.entries[0].Name != "docs" {
+		t.Errorf("a directory should be draggable now, got %+v", app.drag)
 	}
 }
 
@@ -419,7 +475,7 @@ func TestKeyboardTransferMatchesDrag(t *testing.T) {
 
 	app.handleMouse(tea.MouseMsg{X: sidebarWidth + 2, Y: fileRow, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	app.handleMouse(tea.MouseMsg{X: sidebarWidth + localOuter + 2, Y: fileRow, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
-	app.handleMouse(tea.MouseMsg{X: sidebarWidth + localOuter + 2, Y: fileRow, Action: tea.MouseActionRelease, Button: tea.MouseButtonNone})
+	settle(t, app, app.handleMouse(tea.MouseMsg{X: sidebarWidth + localOuter + 2, Y: fileRow, Action: tea.MouseActionRelease, Button: tea.MouseButtonNone}))
 	if app.pending == nil {
 		t.Fatal("the drag produced no request")
 	}
@@ -429,17 +485,17 @@ func TestKeyboardTransferMatchesDrag(t *testing.T) {
 	// Same file, reached with the keyboard.
 	app.focus = focusLocal
 	app.local.cursor = 2
-	app.handleKey(tea.KeyMsg{Type: tea.KeySpace})
+	settle(t, app, app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")}))
 	if app.pending == nil {
-		t.Fatal("space produced no request")
+		t.Fatal("t produced no request")
 	}
-	if viaKey := *app.pending; viaKey != viaDrag {
-		t.Errorf("keyboard request %+v differs from the drag's %+v", viaKey, viaDrag)
+	if diff := requestDiff(*app.pending, viaDrag); diff != "" {
+		t.Errorf("keyboard request differs from the drag's: %s", diff)
 	}
 	app.pending = nil
 
 	// enter on a file does the same; on a directory it navigates instead.
-	app.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	settle(t, app, app.handleKey(tea.KeyMsg{Type: tea.KeyEnter}))
 	if app.pending == nil {
 		t.Error("enter on a file should ask to transfer it")
 	}
@@ -453,13 +509,99 @@ func TestKeyboardTransferMatchesDrag(t *testing.T) {
 		t.Error("enter on a directory must not offer a transfer")
 	}
 
-	// space on a directory is refused outright rather than navigating.
-	app.handleKey(tea.KeyMsg{Type: tea.KeySpace})
-	if app.pending != nil {
-		t.Error("space on a directory must not offer a transfer")
+	// t on a directory copies it, recursively — that is what v3 added.
+	settle(t, app, app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")}))
+	if app.pending == nil {
+		t.Fatal("t on a directory should offer a recursive transfer")
 	}
-	if !strings.Contains(app.errMsg, "not supported") {
-		t.Errorf("expected a refusal message, got %q", app.errMsg)
+	if app.pending.dirs == 0 {
+		t.Errorf("the plan counted no directories: %+v", *app.pending)
+	}
+}
+
+// requestDiff compares the fields that say what would move. transferReq holds
+// slices, so it cannot simply be compared with ==.
+func requestDiff(a, b transferReq) string {
+	switch {
+	case a.upload != b.upload:
+		return fmt.Sprintf("upload %v vs %v", a.upload, b.upload)
+	case a.srcDir != b.srcDir || a.dstDir != b.dstDir:
+		return fmt.Sprintf("dirs %s→%s vs %s→%s", a.srcDir, a.dstDir, b.srcDir, b.dstDir)
+	case a.srcPath() != b.srcPath() || a.dstPath() != b.dstPath():
+		return fmt.Sprintf("paths %s→%s vs %s→%s", a.srcPath(), a.dstPath(), b.srcPath(), b.dstPath())
+	case len(a.entries) != len(b.entries):
+		return fmt.Sprintf("%d entries vs %d", len(a.entries), len(b.entries))
+	case a.total != b.total || a.files != b.files || a.dirs != b.dirs:
+		return fmt.Sprintf("totals %+v vs %+v", a, b)
+	case len(a.overwrite) != len(b.overwrite):
+		return fmt.Sprintf("overwrite %v vs %v", a.overwrite, b.overwrite)
+	}
+	return ""
+}
+
+// TestMarkedTransferIncludesAllSelected: space picks rows, and every way of
+// starting a transfer then moves the whole selection.
+func TestMarkedTransferIncludesAllSelected(t *testing.T) {
+	app := sftpApp(t, 100, 24)
+	app.remote = &sftppkg.Remote{}
+
+	// space marks main.go and notes.txt, moving down as it goes.
+	app.local.cursor = 2
+	app.handleKey(tea.KeyMsg{Type: tea.KeySpace})
+	app.handleKey(tea.KeyMsg{Type: tea.KeySpace})
+	if len(app.local.marked) != 2 {
+		t.Fatalf("marked %v, want main.go and notes.txt", app.local.marked)
+	}
+	if app.pending != nil {
+		t.Error("space must not start a transfer any more — it selects")
+	}
+
+	settle(t, app, app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")}))
+	if app.pending == nil {
+		t.Fatal("t produced no request")
+	}
+	viaKey := *app.pending
+	if len(viaKey.entries) != 2 {
+		t.Errorf("t moved %d entries, want both selected: %+v", len(viaKey.entries), viaKey.entries)
+	}
+	app.pending = nil
+
+	// Dragging one of the selected rows takes the selection with it.
+	localOuter, _ := app.sftpWidths()
+	fileRow := paneBodyTop + 2 // main.go, which is marked
+	app.handleMouse(tea.MouseMsg{X: sidebarWidth + 2, Y: fileRow, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if app.drag == nil || len(app.drag.entries) != 2 {
+		t.Fatalf("dragging a selected row should carry the selection, got %+v", app.drag)
+	}
+	app.handleMouse(tea.MouseMsg{X: sidebarWidth + localOuter + 2, Y: fileRow, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
+	settle(t, app, app.handleMouse(tea.MouseMsg{X: sidebarWidth + localOuter + 2, Y: fileRow, Action: tea.MouseActionRelease, Button: tea.MouseButtonNone}))
+	if app.pending == nil {
+		t.Fatal("the drag produced no request")
+	}
+	if diff := requestDiff(*app.pending, viaKey); diff != "" {
+		t.Errorf("the drag differs from the keyboard: %s", diff)
+	}
+	app.pending = nil
+
+	// An unselected row drags alone and leaves the selection alone.
+	app.handleMouse(tea.MouseMsg{X: sidebarWidth + 2, Y: paneBodyTop + 1, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if app.drag == nil || len(app.drag.entries) != 1 || app.drag.entries[0].Name != "docs" {
+		t.Errorf("an unselected row should drag alone, got %+v", app.drag)
+	}
+	if len(app.local.marked) != 2 {
+		t.Error("dragging an unselected row cleared the selection")
+	}
+
+	// a clears it; a new listing does too.
+	app.drag = nil
+	app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	if len(app.local.marked) != 0 {
+		t.Errorf("a should clear the selection, got %v", app.local.marked)
+	}
+	app.local.marked = map[string]bool{"main.go": true}
+	app.local.setEntries("/elsewhere", nil)
+	if len(app.local.marked) != 0 {
+		t.Error("a new listing must drop the selection — the names mean another directory now")
 	}
 }
 
@@ -566,12 +708,14 @@ type errPermission struct{}
 
 func (errPermission) Error() string { return "permission denied" }
 
-// TestBusyBlocksASecondTransfer: v2 runs one transfer at a time.
+// TestBusyBlocksASecondTransfer: one transfer at a time is still the rule in
+// v3 — a queue is a later version's problem.
 func TestBusyBlocksASecondTransfer(t *testing.T) {
 	app := sftpApp(t, 100, 24)
 	app.remote = &sftppkg.Remote{}
-	app.busy = true
-	app.buildTransfer(focusLocal, model.FileEntry{Name: "main.go", Size: 1})
+	app.transfer = &transferState{prog: &sftppkg.Progress{}, cancel: func() {}, label: "x", started: time.Now()}
+
+	askTransfer(t, app, focusLocal, model.FileEntry{Name: "main.go", Size: 1234})
 	if app.pending != nil {
 		t.Error("a second transfer should be refused while one is running")
 	}
@@ -585,7 +729,7 @@ func TestBusyBlocksASecondTransfer(t *testing.T) {
 func TestPendingSwallowsKeys(t *testing.T) {
 	app := sftpApp(t, 100, 24)
 	app.remote = &sftppkg.Remote{}
-	app.buildTransfer(focusLocal, model.FileEntry{Name: "main.go", Size: 1})
+	askTransfer(t, app, focusLocal, model.FileEntry{Name: "main.go", Size: 1234})
 
 	before := app.local.cursor
 	for _, k := range []tea.KeyMsg{
@@ -603,5 +747,212 @@ func TestPendingSwallowsKeys(t *testing.T) {
 		if app.local.cursor != before || app.focus != focusLocal {
 			t.Errorf("%v leaked into the panes", k)
 		}
+	}
+}
+
+// TestTransferProgressKeepsLayout: the progress bar takes the width that is
+// left, never more — the frame is still one exact rectangle while a copy runs.
+func TestTransferProgressKeepsLayout(t *testing.T) {
+	for _, size := range [][2]int{{100, 24}, {60, 20}, {40, 12}, {200, 60}} {
+		width, height := size[0], size[1]
+		app := sftpApp(t, width, height)
+		app.remote = &sftppkg.Remote{}
+
+		prog := &sftppkg.Progress{}
+		prog.SetTotal(1000)
+		prog.SetName("app.tar.gz")
+		app.transfer = &transferState{
+			prog:    prog,
+			cancel:  func() {},
+			label:   "app.tar.gz",
+			upload:  true,
+			started: time.Now().Add(-2 * time.Second),
+		}
+
+		// Both ends of the range: an unknown total draws an empty track, a known
+		// one draws a bar, and neither may change the frame.
+		for _, total := range []int64{0, 1000} {
+			prog.SetTotal(total)
+			lines := strings.Split(app.View(), "\n")
+			if len(lines) != height {
+				t.Fatalf("%dx%d: %d rows, want %d", width, height, len(lines), height)
+			}
+			for i, l := range lines {
+				if w := ansi.StringWidth(l); w != width {
+					t.Errorf("%dx%d total=%d: row %d is %d wide, want %d", width, height, total, i, w, width)
+				}
+			}
+			// The panes are still standing under the bar.
+			if got := strings.Count(stripANSI(lines[topMargin]), "╭"); got != 3 {
+				t.Errorf("%dx%d: %d panel tops during a transfer, want 3", width, height, got)
+			}
+		}
+	}
+}
+
+// TestProgressBarIsExactlyItsWidth: the bar is drawn by hand precisely so its
+// width is ours to guarantee, at any fill and with no total at all.
+func TestProgressBarIsExactlyItsWidth(t *testing.T) {
+	for _, cols := range []int{1, 8, 20, 77} {
+		for _, done := range []int64{0, 1, 499, 1000, 5000} {
+			for _, total := range []int64{0, 1000} {
+				got := progressBar(cols, done, total)
+				if w := ansi.StringWidth(got); w != cols {
+					t.Errorf("progressBar(%d, %d, %d) is %d wide", cols, done, total, w)
+				}
+			}
+		}
+	}
+	if strings.Contains(stripANSI(progressBar(10, 500, 0)), "▓") {
+		t.Error("an unknown total must not draw a filled bar — it would be a guess")
+	}
+	if got := strings.Count(stripANSI(progressBar(10, 500, 1000)), "▓"); got != 5 {
+		t.Errorf("half done should fill half the bar, got %d of 10", got)
+	}
+}
+
+// TestCtrlCCancelsTransferNotApp: while a copy runs, ctrl+c stops the copy. It
+// must not quit — losing the whole app to a keystroke meant for one transfer is
+// exactly what the binding is there to prevent.
+func TestCtrlCCancelsTransferNotApp(t *testing.T) {
+	app := sftpApp(t, 100, 24)
+	app.remote = &sftppkg.Remote{}
+
+	cancelled := false
+	app.transfer = &transferState{
+		prog:    &sftppkg.Progress{},
+		cancel:  func() { cancelled = true },
+		label:   "big.bin",
+		started: time.Now(),
+	}
+
+	if cmd := app.handleKey(tea.KeyMsg{Type: tea.KeyCtrlC}); cmd != nil {
+		t.Error("ctrl+c during a transfer must not quit the app")
+	}
+	if !cancelled {
+		t.Fatal("ctrl+c did not cancel the transfer")
+	}
+	if app.transfer == nil {
+		t.Fatal("the transfer state must survive until the goroutine reports back")
+	}
+	if !app.transfer.cancelling {
+		t.Error("the status line should say it is cancelling")
+	}
+	if !strings.Contains(stripANSI(app.statusLine()), "cancelling") {
+		t.Errorf("status line: %q", stripANSI(app.statusLine()))
+	}
+
+	// The goroutine answering is what actually clears it, and a cancellation is
+	// reported as an answer rather than an error.
+	var m tea.Model = app
+	m.Update(transferDoneMsg{gen: app.sftpGen, label: "big.bin", err: sftppkg.ErrCancelled})
+	if app.transfer != nil {
+		t.Error("the done message should clear the transfer")
+	}
+	if app.errMsg != "" || !strings.Contains(app.status, "cancelled") {
+		t.Errorf("cancelling is not a failure: err=%q status=%q", app.errMsg, app.status)
+	}
+
+	// With nothing running, ctrl+c is the quit key again. (The zero-value
+	// Remote here has no connection to close, so it is dropped first.)
+	app.remote = nil
+	app.focus = focusSidebar
+	if cmd := app.handleKey(tea.KeyMsg{Type: tea.KeyCtrlC}); cmd == nil {
+		t.Error("ctrl+c with no transfer should still quit")
+	}
+}
+
+// TestRenameSwallowsKeys: the one-line editor owns the keyboard, like every
+// other question in this app.
+func TestRenameSwallowsKeys(t *testing.T) {
+	app := sftpApp(t, 100, 24)
+	app.local.cursor = 2 // main.go
+
+	app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("R")})
+	if app.rename == nil {
+		t.Fatal("R should open the rename input")
+	}
+	if got := app.rename.input.Value(); got != "main.go" {
+		t.Errorf("the input should start from the current name, got %q", got)
+	}
+	if !strings.Contains(stripANSI(app.View()), "Rename") {
+		t.Error("the rename card is not on screen")
+	}
+
+	before := app.local.cursor
+	for _, k := range []tea.KeyMsg{
+		{Type: tea.KeyDown},
+		{Type: tea.KeyTab},
+		{Type: tea.KeyCtrlB},
+		{Type: tea.KeyRunes, Runes: []rune("t")},
+	} {
+		app.handleKey(k)
+		if app.rename == nil {
+			t.Fatalf("%v dismissed the rename input", k)
+		}
+		if app.local.cursor != before || app.focus != focusLocal || app.pending != nil {
+			t.Errorf("%v leaked into the panes", k)
+		}
+	}
+
+	// A path separator is refused rather than silently moving the file.
+	app.rename.input.SetValue("sub/main.go")
+	app.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if app.rename == nil || app.rename.err == "" {
+		t.Fatal("a name with a separator should be refused, not accepted")
+	}
+
+	app.rename.input.SetValue("renamed.go")
+	cmd := app.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if app.rename != nil {
+		t.Fatal("enter should close the input")
+	}
+	if cmd == nil {
+		t.Fatal("enter should produce the rename command")
+	}
+	cmd()
+	br := app.local.br.(*fakeBrowser)
+	if br.renamed != [2]string{"/home/main.go", "/home/renamed.go"} {
+		t.Errorf("renamed %v", br.renamed)
+	}
+
+	// esc leaves everything as it was.
+	app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("R")})
+	app.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if app.rename != nil {
+		t.Error("esc should close the input")
+	}
+}
+
+// TestDeleteCountsBeforeAsking: a recursive delete must never be one keystroke,
+// so the confirmation says how much is inside.
+func TestDeleteCountsBeforeAsking(t *testing.T) {
+	app := sftpApp(t, 100, 24)
+	// docs/ has two files in it, which is what the confirmation has to report.
+	br := app.local.br.(*fakeBrowser)
+	br.dirs["/home/docs"] = []model.FileEntry{
+		{Name: "a.md", Size: 1},
+		{Name: "b.md", Size: 2},
+	}
+
+	app.local.cursor = 1 // docs/
+	settle(t, app, app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")}))
+	if app.confirm == nil {
+		t.Fatal("d should ask before deleting")
+	}
+	body := stripANSI(app.View())
+	for _, want := range []string{"Delete docs?", "1 directory, 2 files"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the confirmation is missing %q:\n%s", want, body)
+		}
+	}
+
+	cmd, handled := app.confirm.resolve(tea.KeyMsg{Type: tea.KeyEnter})
+	if !handled || cmd == nil {
+		t.Fatal("enter should confirm the delete")
+	}
+	cmd()
+	if len(br.removed) != 1 || br.removed[0] != "/home/docs" {
+		t.Errorf("removed %v, want /home/docs", br.removed)
 	}
 }

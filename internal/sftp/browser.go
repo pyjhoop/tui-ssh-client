@@ -18,10 +18,20 @@ import (
 // uses.
 type Browser interface {
 	List(dir string) ([]model.FileEntry, error)
+	// Stat reports the entry at p and whether it exists at all; a missing path
+	// is an answer, not an error. It does not follow symlinks, which is what
+	// lets Plan walk a tree without chasing a cycle.
+	Stat(p string) (model.FileEntry, bool, error)
 	Home() (string, error)
 	Join(dir, name string) string
 	Parent(dir string) string
 	Label() string
+
+	// Remove and Rename are the file-management half. They live on the
+	// interface so the UI never has to know which side of the split view it is
+	// acting on.
+	Remove(p string, recursive bool) error
+	Rename(oldPath, newPath string) error
 }
 
 // Local browses the machine the client runs on.
@@ -43,6 +53,32 @@ func (Local) Home() (string, error) {
 		return wd, nil
 	}
 	return home, nil
+}
+
+// Stat is StatLocal as a method, so Local satisfies Browser.
+func (Local) Stat(p string) (model.FileEntry, bool, error) { return StatLocal(p) }
+
+// Remove deletes a file, or a whole tree when recursive. A non-recursive call
+// on a non-empty directory fails, which is what the confirmation panel relies
+// on to make the user say yes to a recursive delete explicitly.
+func (Local) Remove(p string, recursive bool) error {
+	var err error
+	if recursive {
+		err = os.RemoveAll(p)
+	} else {
+		err = os.Remove(p)
+	}
+	if err != nil {
+		return fmt.Errorf("remove %s: %w", p, err)
+	}
+	return nil
+}
+
+func (Local) Rename(oldPath, newPath string) error {
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return fmt.Errorf("rename %s: %w", oldPath, err)
+	}
+	return nil
 }
 
 // List reads a directory. Entries whose metadata cannot be read are still

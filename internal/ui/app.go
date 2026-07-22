@@ -5,9 +5,12 @@
 package ui
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -94,14 +97,18 @@ type App struct {
 	sftpAddr       string
 	connectingSFTP string
 
-	// drag is non-nil only while a file is being dragged between panes; pending
-	// is the transfer waiting for confirmation, whether it came from a drag or
-	// from the keyboard. busy blocks a second transfer while one is running.
+	// drag is non-nil only while files are being dragged between panes; pending
+	// is the planned transfer waiting for confirmation, whether it came from a
+	// drag or from the keyboard. scanning covers the walk in between, and
+	// transfer is the copy itself — non-nil means one is running, which is what
+	// blocks a second.
 	// sftpErr is a failed connection, drawn as a card floating over the panes.
-	drag    *dragState
-	pending *transferReq
-	busy    bool
-	sftpErr error
+	drag     *dragState
+	pending  *transferReq
+	scanning bool
+	transfer *transferState
+	rename   *renameState
+	sftpErr  error
 
 	// lastAttempt is the server the current connect is for; the error card needs
 	// it to offer retry and edit. lastWasSFTP says which of the two connections
@@ -199,11 +206,57 @@ type listedMsg struct {
 	err     error
 }
 
+// transferState is a copy in flight. The goroutine owns prog and nothing else;
+// the UI reads it on a tick rather than being messaged per chunk, which would
+// be thousands of messages a second for one line of status.
+type transferState struct {
+	prog       *sftppkg.Progress
+	cancel     context.CancelFunc
+	label      string // "app.tar.gz" or "4 items"
+	upload     bool
+	started    time.Time
+	cancelling bool // ctrl+c seen; the goroutine has not stopped yet
+}
+
+// progressInterval is how often the status line is redrawn during a transfer.
+const progressInterval = 100 * time.Millisecond
+
+// progressTickMsg exists only to make the frame render again — its handler
+// changes no state at all, because View reads the counters directly.
+type progressTickMsg struct{ gen int }
+
+// plannedMsg is the walk's answer: what a transfer would move, and how much.
+type plannedMsg struct {
+	gen int
+	req transferReq
+	err error
+}
+
+// deletePlannedMsg is planMsg's counterpart for a delete: the counts that go
+// into the confirmation, so a recursive delete is never one keystroke.
+type deletePlannedMsg struct {
+	gen     int
+	side    focusArea
+	dir     string
+	entries []model.FileEntry
+	files   int
+	dirs    int
+	err     error
+}
+
 type transferDoneMsg struct {
-	gen   int
-	name  string
-	bytes int64
-	err   error
+	gen    int
+	label  string
+	result sftppkg.Result
+	err    error
+}
+
+// fileOpDoneMsg reports a delete or a rename. Both only ever need a status line
+// and a refresh, so they share one message.
+type fileOpDoneMsg struct {
+	gen    int
+	status string
+	err    error
 }
 
 // ── commands ────────────────────────────────────────────────────────────────
@@ -334,20 +387,131 @@ func listDir(br sftppkg.Browser, side focusArea, dir string, gen int) tea.Cmd {
 	}
 }
 
-// runTransfer performs one confirmed copy. v2 runs a single transfer at a time;
-// progress and cancellation are v3.
-func runTransfer(remote *sftppkg.Remote, req transferReq, gen int) tea.Cmd {
+// planArgs is what the walk needs. It is a struct because the caller is
+// assembling seven values that are easy to swap by accident.
+type planArgs struct {
+	src, dst sftppkg.Browser
+	upload   bool
+	srcDir   string
+	dstDir   string
+	entries  []model.FileEntry
+	existing map[string]bool // names already in the destination listing
+	gen      int
+}
+
+// planTransfer walks every picked root and turns it into a request the
+// confirmation panel can describe exactly. It is a command rather than part of
+// buildTransfer because walking a remote directory is a network round trip.
+func planTransfer(args planArgs) tea.Cmd {
 	return func() tea.Msg {
-		var (
-			n   int64
-			err error
-		)
-		if req.upload {
-			n, err = sftppkg.Upload(remote, req.srcPath, req.dstPath)
-		} else {
-			n, err = sftppkg.Download(remote, req.srcPath, req.dstPath)
+		req := transferReq{
+			upload:  args.upload,
+			entries: args.entries,
+			srcDir:  args.srcDir,
+			dstDir:  args.dstDir,
 		}
-		return transferDoneMsg{gen: gen, name: req.entry.Name, bytes: n, err: err}
+		for _, e := range args.entries {
+			root := args.src.Join(args.srcDir, e.Name)
+			items, total, skipped, err := sftppkg.Plan(args.src, root)
+			if err != nil {
+				return plannedMsg{gen: args.gen, err: err}
+			}
+			req.sets = append(req.sets, sftppkg.Set{
+				Upload:  args.upload,
+				SrcRoot: root,
+				DstRoot: args.dst.Join(args.dstDir, e.Name),
+				Items:   items,
+				Skipped: skipped,
+			})
+			req.total += total
+			req.skipped += skipped
+			for _, it := range items {
+				if it.IsDir {
+					req.dirs++
+				} else {
+					req.files++
+				}
+			}
+			if args.existing[e.Name] {
+				req.overwrite = append(req.overwrite, e.Name)
+			}
+		}
+		return plannedMsg{gen: args.gen, req: req}
+	}
+}
+
+// runTransfer performs one confirmed copy. Still one transfer at a time — a
+// queue is not v3 — but it now spans several roots, reports progress through
+// the shared counter and stops when the context is cancelled.
+func runTransfer(ctx context.Context, remote *sftppkg.Remote, req transferReq, prog *sftppkg.Progress, gen int) tea.Cmd {
+	return func() tea.Msg {
+		var total sftppkg.Result
+		for _, set := range req.sets {
+			res, err := sftppkg.RunSet(ctx, remote, set, prog)
+			total.Files += res.Files
+			total.Bytes += res.Bytes
+			total.Skipped += res.Skipped
+			if err != nil {
+				return transferDoneMsg{gen: gen, label: req.label(), result: total, err: err}
+			}
+		}
+		return transferDoneMsg{gen: gen, label: req.label(), result: total}
+	}
+}
+
+// tickProgress reschedules the redraw while a transfer is running. Nothing
+// ticks when the app is idle.
+func tickProgress(gen int) tea.Cmd {
+	return tea.Tick(progressInterval, func(time.Time) tea.Msg {
+		return progressTickMsg{gen: gen}
+	})
+}
+
+// planDelete counts what a delete would remove. Directories are walked for the
+// same reason transfers are: the user has to see the number before saying yes.
+func planDelete(br sftppkg.Browser, side focusArea, dir string, entries []model.FileEntry, gen int) tea.Cmd {
+	return func() tea.Msg {
+		msg := deletePlannedMsg{gen: gen, side: side, dir: dir, entries: entries}
+		for _, e := range entries {
+			items, _, _, err := sftppkg.Plan(br, br.Join(dir, e.Name))
+			if err != nil {
+				return deletePlannedMsg{gen: gen, err: err}
+			}
+			for _, it := range items {
+				if it.IsDir {
+					msg.dirs++
+				} else {
+					msg.files++
+				}
+			}
+		}
+		return msg
+	}
+}
+
+// runDelete removes the confirmed entries. It stops at the first failure and
+// says so — what has already gone is gone.
+func runDelete(br sftppkg.Browser, dir string, entries []model.FileEntry, gen int) tea.Cmd {
+	return func() tea.Msg {
+		for i, e := range entries {
+			if err := br.Remove(br.Join(dir, e.Name), e.IsDir); err != nil {
+				return fileOpDoneMsg{
+					gen:    gen,
+					status: fmt.Sprintf("deleted %d of %d", i, len(entries)),
+					err:    err,
+				}
+			}
+		}
+		return fileOpDoneMsg{gen: gen, status: "deleted " + plural(len(entries), "item")}
+	}
+}
+
+func runRename(br sftppkg.Browser, dir, from, to string, gen int) tea.Cmd {
+	return func() tea.Msg {
+		if err := br.Rename(br.Join(dir, from), br.Join(dir, to)); err != nil {
+			return fileOpDoneMsg{gen: gen, err: err}
+		}
+		return fileOpDoneMsg{gen: gen, status: "renamed to " + to}
 	}
 }
 
@@ -503,19 +667,80 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		pane.setEntries(msg.dir, msg.entries)
 		return a, nil
 
+	case plannedMsg:
+		if msg.gen != a.sftpGen || !a.scanning {
+			return a, nil
+		}
+		a.scanning = false
+		a.status = ""
+		if msg.err != nil {
+			a.errMsg = firstLineOf(msg.err)
+			return a, nil
+		}
+		if len(msg.req.sets) == 0 {
+			return a, nil
+		}
+		req := msg.req
+		a.pending = &req
+		return a, nil
+
+	case deletePlannedMsg:
+		if msg.gen != a.sftpGen || !a.scanning {
+			return a, nil
+		}
+		a.scanning = false
+		a.status = ""
+		if msg.err != nil {
+			a.errMsg = firstLineOf(msg.err)
+			return a, nil
+		}
+		a.confirm = a.deleteConfirm(msg)
+		return a, nil
+
+	case progressTickMsg:
+		// The tick changes nothing: View reads the counters itself, so getting
+		// here at all is the point. Rescheduling stops with the transfer.
+		if msg.gen != a.sftpGen || a.transfer == nil {
+			return a, nil
+		}
+		return a, tickProgress(a.sftpGen)
+
 	case transferDoneMsg:
 		if msg.gen != a.sftpGen {
 			return a, nil
 		}
-		a.busy = false
-		if msg.err != nil {
+		if a.transfer != nil {
+			a.transfer.cancel() // releases the context whichever way this ended
+			a.transfer = nil
+		}
+		switch {
+		case errors.Is(msg.err, sftppkg.ErrCancelled):
+			// Cancelling is an answer, not a failure.
+			a.errMsg = ""
+			a.status = "transfer cancelled"
+		case msg.err != nil:
 			a.errMsg = firstLineOf(msg.err)
 			a.status = ""
+		default:
+			a.errMsg = ""
+			a.status = fmt.Sprintf("sent %s (%s)", msg.label, humanSize(msg.result.Bytes))
+			if msg.result.Skipped > 0 {
+				a.status += fmt.Sprintf(" · skipped %d", msg.result.Skipped)
+			}
+		}
+		// Show the files where they landed instead of making the user press r.
+		return a, a.refreshPanes()
+
+	case fileOpDoneMsg:
+		if msg.gen != a.sftpGen {
 			return a, nil
 		}
-		a.errMsg = ""
-		a.status = fmt.Sprintf("sent %s (%s)", msg.name, humanSize(msg.bytes))
-		// Show the file where it landed instead of making the user press r.
+		if msg.err != nil {
+			a.errMsg = firstLineOf(msg.err)
+		} else {
+			a.errMsg = ""
+		}
+		a.status = msg.status
 		return a, a.refreshPanes()
 
 	case tea.MouseMsg:
@@ -536,7 +761,53 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
+// deleteConfirm turns the counted delete into the shared confirmation. The
+// numbers are the whole point: a recursive delete must never look like a
+// single-file one.
+func (a *App) deleteConfirm(msg deletePlannedMsg) *confirm {
+	pane := a.pane(msg.side)
+	if pane == nil || pane.br == nil || len(msg.entries) == 0 {
+		return nil
+	}
+
+	head := fmt.Sprintf("Delete %s?", plural(len(msg.entries), "item"))
+	if len(msg.entries) == 1 {
+		head = fmt.Sprintf("Delete %s?", msg.entries[0].Name)
+	}
+	detail := plural(msg.files, "file")
+	if msg.dirs > 0 {
+		detail = plural(msg.dirs, "directory") + ", " + detail
+	}
+
+	warn := ""
+	if msg.dirs > 0 {
+		warn = "⚠ directories are deleted with everything inside them"
+	}
+
+	return &confirm{
+		title:  "Delete",
+		lines:  []string{head, "", detail, "in  " + msg.dir},
+		warn:   warn,
+		accept: "[enter] delete",
+		onYes:  runDelete(pane.br, msg.dir, msg.entries, a.sftpGen),
+	}
+}
+
 func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
+	// ctrl+c means "stop the transfer", not "quit", while one is running. The
+	// session branch below still gets it when the shell is focused: a remote
+	// program needs its own interrupt.
+	if a.transfer != nil && a.focus != focusSession && msg.Type == tea.KeyCtrlC {
+		a.cancelTransfer()
+		return nil
+	}
+
+	// The rename input owns the keyboard the same way a confirmation does, and
+	// for the same reason — it is the newest question on screen.
+	if a.rename != nil {
+		return a.resolveRename(msg)
+	}
+
 	// A confirmation owns the keyboard while it is up. Unhandled keys are
 	// dropped rather than forwarded, so nothing leaks into the session behind it.
 	if a.confirm != nil {
@@ -618,7 +889,7 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		case "q", "ctrl+c":
 			a.quitting = true
 			a.teardownSession()
-			a.teardownSFTP()
+			a.teardownSFTP() // cancels a running transfer first
 			return tea.Quit
 		case "enter":
 			return a.activateSelection()
@@ -837,7 +1108,7 @@ func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	// The split view owns press, motion and release while it is up — that three
 	// step sequence is the drag. A dialog floating over the panes blocks it, the
 	// same way it blocks the keyboard.
-	if a.rightMode == rightSFTP && a.confirm == nil && a.pending == nil && a.sftpErr == nil {
+	if a.rightMode == rightSFTP && a.confirm == nil && a.pending == nil && a.rename == nil && a.sftpErr == nil {
 		if cmd, handled := a.handleSFTPMouse(msg); handled {
 			return cmd
 		}
@@ -1022,6 +1293,12 @@ func (a *App) teardownSession() {
 // teardownSFTP closes the file connection. It is independent of the terminal
 // session on purpose: the two are separate TCP connections.
 func (a *App) teardownSFTP() {
+	// Stop the copy before the connection under it goes: the goroutine must not
+	// outlive the app it is reporting to.
+	if a.transfer != nil {
+		a.transfer.cancel()
+		a.transfer = nil
+	}
 	if a.remote != nil {
 		_ = a.remote.Close()
 		a.remote = nil
@@ -1029,8 +1306,8 @@ func (a *App) teardownSFTP() {
 	a.remotePane = filePane{rows: a.remotePane.rows}
 	a.sftpID = ""
 	a.sftpName, a.sftpAddr = "", ""
-	a.drag, a.pending = nil, nil
-	a.busy = false
+	a.drag, a.pending, a.rename = nil, nil, nil
+	a.scanning = false
 	a.sftpErr = nil
 	a.sftpGen++
 }
@@ -1228,10 +1505,12 @@ func inset(s string) string {
 
 func (a *App) statusLine() string {
 	switch {
+	case a.transfer != nil:
+		return a.transferStatus()
 	case a.drag != nil:
-		return styleWarning.Render("↦ " + a.drag.entry.Name + " · drop on the other pane to transfer")
-	case a.busy:
-		return styleStatus.Render("transferring…")
+		return styleWarning.Render("↦ " + a.drag.label() + " · drop on the other pane to transfer")
+	case a.scanning:
+		return styleStatus.Render("scanning…")
 	case a.warning != "":
 		return styleWarning.Render(a.warning)
 	case a.errMsg != "" && a.rightMode != rightEmpty:
@@ -1239,7 +1518,7 @@ func (a *App) statusLine() string {
 	case a.status != "":
 		return styleStatus.Render(a.status)
 	case a.rightMode == rightSFTP:
-		return styleStatus.Render("tab switch pane · enter open/send · space send · r refresh · drag to transfer · " + escapeHint + " back")
+		return styleStatus.Render("tab pane · space select · t send · d delete · R rename · r refresh · drag to transfer · " + escapeHint + " back")
 	default:
 		return styleStatus.Render("tab focus panel · f files · " + escapeHint + " leave session · q quit")
 	}

@@ -79,8 +79,11 @@ func (r *Remote) List(dir string) ([]model.FileEntry, error) {
 
 // Stat reports the entry at p and whether it exists at all. A missing file is
 // not an error here: the caller is asking precisely to find that out.
+//
+// Like StatLocal it does not follow symlinks — Plan has to see the link itself
+// to skip it rather than walk into a cycle.
 func (r *Remote) Stat(p string) (model.FileEntry, bool, error) {
-	info, err := r.sc.Stat(p)
+	info, err := r.sc.Lstat(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return model.FileEntry{}, false, nil
@@ -94,6 +97,53 @@ func (r *Remote) Stat(p string) (model.FileEntry, bool, error) {
 		ModTime: info.ModTime(),
 		IsDir:   info.IsDir(),
 	}, true, nil
+}
+
+// Remove deletes a remote file, or a whole tree when recursive. pkg/sftp has no
+// RemoveAll, so the tree walk is ours: children first, then the directory, or
+// the server refuses to unlink a non-empty one.
+func (r *Remote) Remove(p string, recursive bool) error {
+	if !recursive {
+		if err := r.sc.Remove(p); err != nil {
+			return fmt.Errorf("remove %s: %w", p, err)
+		}
+		return nil
+	}
+	if err := r.removeTree(p); err != nil {
+		return fmt.Errorf("remove %s: %w", p, err)
+	}
+	return nil
+}
+
+func (r *Remote) removeTree(p string) error {
+	info, err := r.sc.Lstat(p)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	// A symlink is unlinked, never descended into: following it would delete
+	// whatever it happens to point at.
+	if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+		children, err := r.sc.ReadDir(p)
+		if err != nil {
+			return err
+		}
+		for _, c := range children {
+			if err := r.removeTree(path.Join(p, c.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return r.sc.Remove(p)
+}
+
+func (r *Remote) Rename(oldPath, newPath string) error {
+	if err := r.sc.Rename(oldPath, newPath); err != nil {
+		return fmt.Errorf("rename %s: %w", oldPath, err)
+	}
+	return nil
 }
 
 // Close tears down the subsystem and then the connection under it.

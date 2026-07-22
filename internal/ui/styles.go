@@ -53,6 +53,15 @@ var (
 
 	styleRowDragged = lipgloss.NewStyle().Foreground(colorWarn)
 
+	// styleRowMarked colours a multi-selected row. The cursor style wins when a
+	// row is both, so the marker glyph is what still distinguishes it.
+	styleRowMarked = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+
+	// The progress bar is drawn by hand rather than with bubbles/progress: its
+	// width is part of the layout arithmetic, so nothing else may decide it.
+	styleBarFill  = lipgloss.NewStyle().Foreground(colorAccent)
+	styleBarEmpty = lipgloss.NewStyle().Foreground(colorAccentDim)
+
 	// styleModal is the floating dialog in the split view. Its border is the
 	// accent colour so it reads as being on top of the panes, not one of them.
 	styleModal = lipgloss.NewStyle().
