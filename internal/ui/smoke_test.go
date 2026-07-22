@@ -37,6 +37,8 @@ func TestSmoke(t *testing.T) {
 		m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)})
 	}
 
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // → Group
+	typeText("prod")
 	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // → Host
 	typeText("example.com")
 	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // → Port
@@ -54,7 +56,7 @@ func TestSmoke(t *testing.T) {
 	if keyBody != "" {
 		t.Errorf("no key was pasted, got body %q", keyBody)
 	}
-	want := model.Server{Host: "example.com", Port: 2222, User: "deploy", Auth: model.AuthPassword, Password: "hunter2"}
+	want := model.Server{Host: "example.com", Port: 2222, User: "deploy", Auth: model.AuthPassword, Password: "hunter2", Group: "prod"}
 	if srv != want {
 		t.Fatalf("form.Server: got %+v, want %+v", srv, want)
 	}
@@ -668,5 +670,108 @@ func TestLayoutAlignmentWithPanels(t *testing.T) {
 				t.Errorf("%s %dx%d: panels do not close on the same row: %q", name, width, height, stripANSI(bottom))
 			}
 		}
+	}
+}
+
+// TestLayoutAlignmentWithGroupsAndImport extends the alignment invariant over
+// everything v5 adds: group headers, a live filter, and the import preview. The
+// vertical budget must be unchanged — none of these may cost the panels a row.
+func TestLayoutAlignmentWithGroupsAndImport(t *testing.T) {
+	longName := strings.Repeat("very-long-server-name-", 4)
+
+	states := map[string]func(*App){
+		"groups": func(a *App) {},
+		"collapsed group": func(a *App) {
+			a.sidebar.SetCollapsed([]string{"prod"})
+		},
+		"filtering": func(a *App) {
+			a.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+			a.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("prod")})
+		},
+		"import": func(a *App) {
+			a.prevRight = a.rightMode
+			a.rightMode = rightImport
+			a.focus = focusImport
+			a.Update(sshConfigParsedMsg{path: "/tmp/ssh_config", entries: []config.SSHConfigEntry{
+				{Alias: longName, Host: "10.0.0.1", User: "deploy", Port: 22, Identity: "/home/me/.ssh/id_ed25519"},
+				{Alias: "*", Skip: true, Reason: "wildcard pattern"},
+			}})
+		},
+		"import while parsing": func(a *App) {
+			a.rightMode = rightImport
+			a.focus = focusImport
+			a.importing = &importer{path: "/tmp/ssh_config"}
+		},
+	}
+
+	for name, setup := range states {
+		for _, size := range [][2]int{{100, 24}, {80, 30}, {200, 60}, {40, 10}} {
+			width, height := size[0], size[1]
+
+			app := New(config.New(t.TempDir()))
+			app.servers = []model.Server{
+				{ID: "1", Name: "laptop", Host: "10.0.0.1", User: "me", Port: 22},
+				{ID: "2", Name: longName, Host: "10.0.1.1", User: "deploy", Port: 22, Group: "prod"},
+				{ID: "3", Name: "web-2", Host: "10.0.1.2", User: "deploy", Port: 22, Group: "prod"},
+			}
+			app.sidebar.SetServers(app.servers)
+			app.resize(width, height)
+			setup(app)
+
+			lines := strings.Split(app.View(), "\n")
+			if len(lines) != height {
+				t.Errorf("%s %dx%d: rendered %d rows, want %d", name, width, height, len(lines), height)
+				continue
+			}
+			for i, l := range lines {
+				if w := ansi.StringWidth(l); w != width {
+					t.Errorf("%s %dx%d: row %d is %d columns wide, want %d", name, width, height, i, w, width)
+				}
+			}
+			if bottom := lines[height-statusRows-1]; strings.Count(stripANSI(bottom), "╰") != 2 {
+				t.Errorf("%s %dx%d: panels do not close on the same row: %q", name, width, height, stripANSI(bottom))
+			}
+		}
+	}
+}
+
+// TestTabsSurviveImportAndFilter: the list is a way to pick a server, not a
+// thing sessions depend on. Filtering it or importing into it must not disturb
+// a single tab.
+func TestTabsSurviveImportAndFilter(t *testing.T) {
+	app := New(config.New(t.TempDir()))
+	app.servers = []model.Server{
+		{ID: "1", Name: "a", Host: "10.0.0.1", User: "u", Port: 22},
+		{ID: "2", Name: "b", Host: "10.0.0.2", User: "u", Port: 22, Group: "prod"},
+	}
+	app.sidebar.SetServers(app.servers)
+	app.resize(120, 40)
+
+	app.tabs = []*sessionTab{{name: "a", gen: 1}, {name: "b", gen: 2}}
+	app.active = 1
+
+	// Filter, then leave it.
+	app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	app.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+
+	// Fold a group.
+	app.sidebar.list.Select(2)
+	app.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+
+	// Open and cancel the import preview.
+	app.prevRight = app.rightMode
+	app.rightMode = rightImport
+	app.focus = focusImport
+	app.Update(sshConfigParsedMsg{path: "/tmp/x", entries: []config.SSHConfigEntry{
+		{Alias: "c", Host: "10.0.0.3", User: "u", Port: 22},
+	}})
+	app.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if len(app.tabs) != 2 {
+		t.Fatalf("%d tabs survived, want 2", len(app.tabs))
+	}
+	if app.active != 1 {
+		t.Errorf("active tab moved to %d, want 1", app.active)
 	}
 }

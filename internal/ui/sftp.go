@@ -371,7 +371,7 @@ func otherSide(side focusArea) focusArea {
 // previous connection is dropped when it lands.
 func (a *App) openSFTP() tea.Cmd {
 	it, ok := a.sidebar.Selected()
-	if !ok || it.connect {
+	if !ok || !a.isServerRow(it) {
 		return nil
 	}
 	srv := it.server

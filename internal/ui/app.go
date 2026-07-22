@@ -29,6 +29,7 @@ const (
 	focusSession
 	focusLocal
 	focusRemote
+	focusImport
 )
 
 type rightMode int
@@ -39,6 +40,7 @@ const (
 	rightTerminal
 	rightError
 	rightSFTP
+	rightImport
 )
 
 // escapeHint is the key that moves focus out of a live session.
@@ -77,6 +79,12 @@ type App struct {
 	// confirm, when set, replaces the right panel body and swallows every key
 	// that is not an answer to it.
 	confirm *confirm
+
+	// importing is the ~/.ssh/config preview, non-nil only in rightImport mode.
+	// prevRight is the mode to fall back to when it is cancelled, so leaving the
+	// preview never disturbs the open session tabs.
+	importing *importer
+	prevRight rightMode
 
 	// SFTP state. The connection is deliberately separate from the terminal
 	// session's: closing one leaves the other alive. sftpGen plays the same role
@@ -130,7 +138,7 @@ func New(store *config.Store) *App {
 }
 
 func (a *App) Init() tea.Cmd {
-	return tea.Batch(loadServers(a.store), waitForHostKey(a.hostKeys))
+	return tea.Batch(loadServers(a.store), loadUIState(a.store), waitForHostKey(a.hostKeys))
 }
 
 // ── messages ────────────────────────────────────────────────────────────────
@@ -144,6 +152,26 @@ type serverSavedMsg struct {
 	servers []model.Server
 	warn    string
 	err     error
+}
+
+// uiStateLoadedMsg carries the fold and sort preferences. It has no error field
+// on purpose: a missing or unreadable ui.json is a normal startup.
+type uiStateLoadedMsg struct{ state config.UIState }
+
+// sshConfigParsedMsg is the result of reading ~/.ssh/config for the import
+// preview. Parsing is file IO, so it never happens inside Update.
+type sshConfigParsedMsg struct {
+	path    string
+	entries []config.SSHConfigEntry
+	err     error
+}
+
+// serversImportedMsg reports a finished import: one Save for the whole batch.
+type serversImportedMsg struct {
+	servers  []model.Server
+	imported int
+	skipped  int
+	err      error
 }
 
 type connectedMsg struct {
@@ -262,6 +290,45 @@ func loadServers(store *config.Store) tea.Cmd {
 	return func() tea.Msg {
 		servers, err := store.Load()
 		return serversLoadedMsg{servers: servers, err: err}
+	}
+}
+
+func loadUIState(store *config.Store) tea.Cmd {
+	return func() tea.Msg {
+		return uiStateLoadedMsg{state: store.LoadUIState()}
+	}
+}
+
+// saveUIState persists the fold and sort preferences. A failure is deliberately
+// swallowed: this file is view sludge, and a warning about it would be noise on
+// top of a session the user actually cares about.
+func saveUIState(store *config.Store, st config.UIState) tea.Cmd {
+	return func() tea.Msg {
+		_ = store.SaveUIState(st)
+		return nil
+	}
+}
+
+func parseSSHConfigCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		entries, err := config.ParseSSHConfig(path)
+		return sshConfigParsedMsg{path: path, entries: entries, err: err}
+	}
+}
+
+// importServers appends the chosen entries in one write. Saving per entry would
+// rewrite servers.json once per host for no gain.
+func importServers(store *config.Store, chosen []model.Server, skipped int) tea.Cmd {
+	return func() tea.Msg {
+		servers, err := store.AddAll(chosen)
+		if err != nil {
+			return serversImportedMsg{err: err}
+		}
+		return serversImportedMsg{
+			servers:  servers,
+			imported: len(chosen),
+			skipped:  skipped,
+		}
 	}
 }
 
@@ -548,6 +615,41 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.sidebar.SetServers(a.servers)
 		return a, nil
 
+	case uiStateLoadedMsg:
+		a.sidebar.SetCollapsed(msg.state.Collapsed)
+		a.sidebar.SetSortRecent(msg.state.SortRecent)
+		return a, nil
+
+	case sshConfigParsedMsg:
+		if msg.err != nil {
+			a.errMsg = msg.err.Error()
+			a.importing, a.rightMode = nil, a.prevRight
+			a.focus = focusSidebar
+			return a, nil
+		}
+		if len(msg.entries) == 0 {
+			a.importing, a.rightMode = nil, a.prevRight
+			a.focus = focusSidebar
+			a.status = "no Host blocks in " + msg.path
+			return a, nil
+		}
+		im := newImporter(msg.path, msg.entries, a.servers)
+		a.importing = &im
+		return a, nil
+
+	case serversImportedMsg:
+		a.importing = nil
+		a.rightMode = a.prevRight
+		a.focus = focusSidebar
+		if msg.err != nil {
+			a.errMsg = msg.err.Error()
+			return a, nil
+		}
+		a.servers = msg.servers
+		a.sidebar.SetServers(a.servers)
+		a.status = fmt.Sprintf("imported %d servers (%d skipped)", msg.imported, msg.skipped)
+		return a, nil
+
 	case serverSavedMsg:
 		if msg.err != nil {
 			a.form.err = msg.err.Error()
@@ -599,7 +701,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			t.activity = true
 		}
-		return a, waitForOutput(msg.session, t.gen)
+		return a, tea.Batch(waitForOutput(msg.session, t.gen), a.markUsed(t.id))
 
 	case connectFailedMsg:
 		t, ok := a.tabByGen(msg.gen)
@@ -849,11 +951,25 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
+	// The filter is the newest question on screen, so it owns every key while it
+	// is being typed — q and ctrl+c included. A search you cannot type "q" into
+	// is not a search; esc closes it and the shortcuts come back. This is the
+	// same "a dialog swallows the keyboard" rule confirm and pending follow,
+	// applied to the list.
+	if a.focus == focusSidebar && a.sidebar.Filtering() {
+		return a.sidebar.Update(msg)
+	}
+
 	// Tab switching works from anywhere, session focus included: alt combinations
 	// are ours, everything else the shell may still need. tabKey stands down
 	// while a dialog is up, like every other binding.
 	if cmd, handled := a.tabKey(msg); handled {
 		return cmd
+	}
+
+	// The import preview is modal for the same reason.
+	if a.focus == focusImport {
+		return a.handleImportKey(msg)
 	}
 
 	// The rename input owns the keyboard the same way a confirmation does, and
@@ -957,17 +1073,41 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 			return tea.Quit
 		case "enter":
 			return a.activateSelection()
+		case " ":
+			// Only meaningful on a header; on a server row the list keeps its
+			// own handling of the key.
+			if cmd, ok := a.toggleGroup(); ok {
+				return cmd
+			}
+		case "left", "right":
+			// A direction says which way to fold, unlike the toggles above.
+			if it, ok := a.sidebar.Selected(); ok && it.header {
+				if a.sidebar.SetGroupCollapsed(msg.String() == "left") {
+					return a.persistUIState()
+				}
+				return nil
+			}
+		case "i":
+			return a.openImport()
+		case "s":
+			a.sidebar.SetSortRecent(!a.sidebar.SortRecent())
+			if a.sidebar.SortRecent() {
+				a.status = "sorted by last used"
+			} else {
+				a.status = "sorted by saved order"
+			}
+			return a.persistUIState()
 		case "n":
 			// A second session to a server that already has one. enter reuses
 			// the open tab, so this is the only way to ask for another.
-			if it, ok := a.sidebar.Selected(); ok && !it.connect {
+			if it, ok := a.sidebar.Selected(); ok && a.isServerRow(it) {
 				return a.openTab(it.server, true)
 			}
 			return nil
 		case "f":
 			return a.openSFTP()
 		case "e":
-			if it, ok := a.sidebar.Selected(); ok && !it.connect {
+			if it, ok := a.sidebar.Selected(); ok && a.isServerRow(it) {
 				return a.editServer(it.server)
 			}
 			return nil
@@ -999,12 +1139,21 @@ func (a *App) activateSelection() tea.Cmd {
 	if !ok {
 		return nil
 	}
+	// A group header folds instead of connecting: there is no session behind it.
+	if it.header {
+		if cmd, ok := a.toggleGroup(); ok {
+			return cmd
+		}
+		return nil
+	}
+
 	a.errMsg = ""
 	a.status = ""
 
 	if it.connect {
 		w, h := a.rightInner()
 		a.form = newForm(w, h)
+		a.form.setGroups(a.sidebar.Groups())
 		a.rightMode = rightForm
 		a.focus = focusForm
 		return nil
@@ -1013,6 +1162,32 @@ func (a *App) activateSelection() tea.Cmd {
 	// A server that already has a tab is shown rather than dialled again; n is
 	// how you ask for a second session to the same host.
 	return a.openTab(it.server, false)
+}
+
+// markUsed stamps a server as most recently connected, for the recent-first
+// sort. Only a session that actually came up counts — a failed dial says
+// nothing about which host you work on.
+//
+// The in-memory copy is updated straight away so the sidebar reorders now; the
+// write is best-effort, because losing a sort key is not worth an error card.
+func (a *App) markUsed(id string) tea.Cmd {
+	if id == "" {
+		return nil
+	}
+	now := time.Now()
+	for i := range a.servers {
+		if a.servers[i].ID != id {
+			continue
+		}
+		a.servers[i].LastUsed = now
+		srv := a.servers[i]
+		a.sidebar.SetServers(a.servers)
+		return func() tea.Msg {
+			_ = a.store.Update(srv)
+			return nil
+		}
+	}
+	return nil
 }
 
 // tabIndexOf locates a tab by identity, since messages carry the tab itself.
@@ -1056,12 +1231,92 @@ func (a *App) dismissError() {
 	}
 }
 
+// isServerRow reports whether a row is an actual server, i.e. whether the
+// server-targeted shortcuts (n/e/d/f) mean anything on it. The connect action
+// and group headers are not.
+func (a *App) isServerRow(it item) bool { return !it.connect && !it.header }
+
+// toggleGroup folds the highlighted header and persists the change, reporting
+// whether the cursor was on one at all.
+func (a *App) toggleGroup() (tea.Cmd, bool) {
+	if !a.sidebar.ToggleGroup() {
+		return nil, false
+	}
+	return a.persistUIState(), true
+}
+
+// persistUIState mirrors the sidebar's view preferences to ui.json.
+func (a *App) persistUIState() tea.Cmd {
+	return saveUIState(a.store, config.UIState{
+		Collapsed:  a.sidebar.CollapsedGroups(),
+		SortRecent: a.sidebar.SortRecent(),
+	})
+}
+
+// openImport shows the ~/.ssh/config preview. Nothing is read here — parsing is
+// file IO, so it goes through a command like every other blocking call.
+func (a *App) openImport() tea.Cmd {
+	path := config.DefaultSSHConfigPath()
+	if path == "" {
+		a.status = "no ~/.ssh/config"
+		return nil
+	}
+	im := importer{path: path}
+	a.importing = &im
+	a.prevRight = a.rightMode
+	a.rightMode = rightImport
+	a.focus = focusImport
+	a.errMsg = ""
+	a.status = ""
+	return parseSSHConfigCmd(path)
+}
+
+// closeImport returns to whatever the right panel was showing before, leaving
+// the session tabs untouched.
+func (a *App) closeImport() {
+	a.importing = nil
+	a.rightMode = a.prevRight
+	a.focus = focusSidebar
+}
+
+// handleImportKey owns every key while the preview is up.
+func (a *App) handleImportKey(msg tea.KeyMsg) tea.Cmd {
+	im := a.importing
+	if im == nil {
+		a.focus = focusSidebar
+		return nil
+	}
+	switch msg.String() {
+	case "esc", "q", "ctrl+c":
+		a.closeImport()
+		a.status = "import cancelled"
+	case "up", "k":
+		im.move(-1)
+	case "down", "j":
+		im.move(1)
+	case " ":
+		im.toggle()
+	case "a":
+		im.toggleAll()
+	case "enter":
+		chosen := im.selected()
+		if len(chosen) == 0 {
+			a.closeImport()
+			a.status = "nothing selected"
+			return nil
+		}
+		return importServers(a.store, chosen, im.skipped())
+	}
+	return nil
+}
+
 func (a *App) editServer(srv model.Server) tea.Cmd {
 	if srv.ID == "" {
 		return nil
 	}
 	w, h := a.rightInner()
 	a.form = newFormFor(srv, w, h)
+	a.form.setGroups(a.sidebar.Groups())
 	a.rightMode = rightForm
 	a.focus = focusForm
 	a.errMsg = ""
@@ -1073,7 +1328,7 @@ func (a *App) editServer(srv model.Server) tea.Cmd {
 // something to do on a single keystroke.
 func (a *App) deleteSelection() tea.Cmd {
 	it, ok := a.sidebar.Selected()
-	if !ok || it.connect {
+	if !ok || !a.isServerRow(it) {
 		return nil
 	}
 	srv := it.server
@@ -1260,21 +1515,25 @@ func (a *App) wheelOverTerminal(msg tea.MouseMsg) bool {
 
 // listHeaderRows is how far the first list item sits below the top of the
 // screen: the margin, the panel border, and the list's own title block (title
-// plus the blank line under it). sidebarRowsPerItem is the default delegate's
-// two rows plus its spacer. TestSidebarRowGeometry pins both.
+// plus the blank line under it). sidebarRowsPerItem is rowDelegate's height —
+// one, since v5, which is why a screen row now maps straight to an item.
+// TestSidebarRowGeometry pins both.
 const (
 	listHeaderRows     = topMargin + 1 + 2
-	sidebarRowsPerItem = 3
+	sidebarRowsPerItem = 1
 )
 
 // rowToIndex maps a screen row inside the sidebar to a list index.
+//
+// It counts rendered rows, not servers: group headers are items too, and a
+// collapsed group's members are not items at all.
 func (a *App) rowToIndex(y int) (int, bool) {
 	rel := y - listHeaderRows
 	if rel < 0 {
 		return 0, false
 	}
-	idx := rel / sidebarRowsPerItem
-	if idx >= len(a.servers)+1 {
+	idx := rel/sidebarRowsPerItem + a.sidebar.list.Paginator.Page*a.sidebar.list.Paginator.PerPage
+	if idx >= len(a.sidebar.list.VisibleItems()) {
 		return 0, false
 	}
 	return idx, true
@@ -1398,7 +1657,7 @@ func (a *App) View() string {
 		// The right panel gets a title bar of its own, mirroring the sidebar's
 		// "Servers" heading, so a live session always announces which host it is.
 		rightContent := a.rightHeader(cols) + "\n" + clampBlock(a.rightBody(cols, rows), cols, rows)
-		right = panelStyle(a.focus == focusSession || a.focus == focusForm).
+		right = panelStyle(a.focus == focusSession || a.focus == focusForm || a.focus == focusImport).
 			Render(clampBlock(rightContent, cols, a.panelHeight()))
 	}
 
@@ -1528,6 +1787,11 @@ func (a *App) rightHeader(cols int) string {
 	case rightError:
 		title = "Connection failed"
 		detail = a.lastAttempt.Title()
+	case rightImport:
+		title = "Import ssh config"
+		if a.importing != nil && len(a.importing.rows) == 0 {
+			detail = "reading…"
+		}
 	}
 
 	line := strings.Repeat(" ", padX) + styleTitleBar.Render(title)
@@ -1563,6 +1827,15 @@ func (a *App) rightBody(cols, rows int) string {
 
 	case rightError:
 		return inset(errorCard(a.failErr, a.lastAttempt))
+
+	case rightImport:
+		if a.importing == nil {
+			return inset("no ssh config")
+		}
+		if len(a.importing.rows) == 0 {
+			return inset("reading " + a.importing.path + "…")
+		}
+		return inset(a.importing.View(cols-2*padX, rows))
 
 	default:
 		var b strings.Builder
@@ -1603,6 +1876,10 @@ func (a *App) statusLine() string {
 		return a.tabStatus(a.cur())
 	case a.status != "":
 		return styleStatus.Render(a.status)
+	case a.sidebar.Filtering():
+		return styleStatus.Render("type to filter · enter keep results · esc clear")
+	case a.rightMode == rightImport:
+		return styleStatus.Render("space select · a all/none · enter import · esc cancel")
 	case a.rightMode == rightSFTP:
 		return styleStatus.Render("tab pane · space select · t send · d delete · R rename · r refresh · drag to transfer · " + escapeHint + " back")
 	case len(a.tabs) > 1:

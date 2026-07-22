@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -26,6 +27,7 @@ const (
 // text input behind it.
 const (
 	fieldName = iota
+	fieldGroup
 	fieldHost
 	fieldPort
 	fieldUser
@@ -49,6 +51,9 @@ type form struct {
 	// It decides between Store.Add and Store.Update, and keeps keys/<id>.pem
 	// pointing at the same file.
 	editingID string
+	// lastUsed is carried through untouched: Update replaces the whole entry, so
+	// a field with no input behind it would be erased by every edit.
+	lastUsed time.Time
 
 	auth    model.AuthMethod
 	focused int
@@ -69,6 +74,7 @@ func newForm(width, height int) form {
 	}
 
 	f.inputs[fieldName] = mk("optional label")
+	f.inputs[fieldGroup] = mk("optional folder")
 	f.inputs[fieldHost] = mk("example.com")
 	f.inputs[fieldPort] = mk(strconv.Itoa(model.DefaultPort))
 	f.inputs[fieldUser] = mk("root")
@@ -95,12 +101,14 @@ func newForm(width, height int) form {
 func newFormFor(srv model.Server, width, height int) form {
 	f := newForm(width, height)
 	f.editingID = srv.ID
+	f.lastUsed = srv.LastUsed
 	f.auth = srv.Auth
 	if f.auth == "" {
 		f.auth = model.AuthPassword
 	}
 
 	f.inputs[fieldName].SetValue(srv.Name)
+	f.inputs[fieldGroup].SetValue(srv.Group)
 	f.inputs[fieldHost].SetValue(srv.Host)
 	port := srv.Port
 	if port == 0 {
@@ -279,8 +287,18 @@ func (f *form) fieldAtRow(y int) (int, bool) {
 	return 0, false
 }
 
+// setGroups shows the groups that already exist as the Group placeholder. It is
+// a hint, not a completion: a one-line input does not get a popup.
+func (f *form) setGroups(groups []string) {
+	if len(groups) == 0 {
+		return
+	}
+	f.inputs[fieldGroup].Placeholder = "optional folder · " + strings.Join(groups, ", ")
+}
+
 var fieldLabels = [fieldCount]string{
 	fieldName:    "Name",
+	fieldGroup:   "Group",
 	fieldHost:    "Host",
 	fieldPort:    "Port",
 	fieldUser:    "User",
@@ -358,12 +376,14 @@ func (f *form) Server() (model.Server, string, error) {
 	}
 
 	srv := model.Server{
-		ID:   f.editingID,
-		Name: strings.TrimSpace(f.inputs[fieldName].Value()),
-		Host: strings.TrimSpace(f.inputs[fieldHost].Value()),
-		Port: port,
-		User: strings.TrimSpace(f.inputs[fieldUser].Value()),
-		Auth: f.auth,
+		ID:       f.editingID,
+		Name:     strings.TrimSpace(f.inputs[fieldName].Value()),
+		Group:    strings.TrimSpace(f.inputs[fieldGroup].Value()),
+		Host:     strings.TrimSpace(f.inputs[fieldHost].Value()),
+		Port:     port,
+		User:     strings.TrimSpace(f.inputs[fieldUser].Value()),
+		Auth:     f.auth,
+		LastUsed: f.lastUsed,
 	}
 
 	keyBody := ""

@@ -1,0 +1,38 @@
+# ── 절대 커밋하면 안 되는 것: 이 앱이 다루는 자격증명 ──────────────────────
+# 정상 위치는 ${XDG_CONFIG_HOME:-~/.config}/ssh-client/ 이라 레포 안에 생길 일이
+# 없지만, 테스트나 XDG_CONFIG_HOME=. 같은 실행 한 번이면 여기에 떨어진다.
+# servers.json 은 비밀번호를 평문으로 담는다(v0 결정) — 사고를 되돌릴 수 없다.
+servers.json
+servers.json.tmp
+ui.json
+ui.json.tmp
+known_hosts
+.plaintext-warning-ack
+keys/
+
+# 개인키 — 폼에 붙여넣은 키는 keys/<id>.pem 으로 저장되고, 사용자가 레포 근처에
+# 키를 두는 경우도 막는다.
+*.pem
+*.key
+id_rsa*
+id_ecdsa*
+id_ed25519*
+*.pub
+
+# ── 빌드 산출물 ────────────────────────────────────────────────────────────
+/ssh-client
+*.exe
+*.test
+*.out
+/dist/
+
+# ── 에디터 · OS ────────────────────────────────────────────────────────────
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# ── 로컬 도구 설정 ─────────────────────────────────────────────────────────
+# .claude/settings.local.json 은 이름 그대로 이 머신 전용이다.
+.claude/settings.local.json

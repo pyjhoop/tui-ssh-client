@@ -62,6 +62,19 @@ var (
 	// row is both, so the marker glyph is what still distinguishes it.
 	styleRowMarked = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
 
+	// styleGroupHeader is a sidebar folder row. It is bold rather than filled so
+	// it reads as a divider between servers, not as another selectable server.
+	styleGroupHeader = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+
+	// styleRowDetail is the dim right-hand half of a one-line row: the sidebar's
+	// user@host and the importer's target.
+	styleRowDetail = lipgloss.NewStyle().Foreground(colorMuted)
+
+	// styleSkipped greys out an ssh_config block we refuse to import, and
+	// styleDupBadge marks one that is already in the list.
+	styleSkipped  = lipgloss.NewStyle().Foreground(colorMuted).Italic(true)
+	styleDupBadge = lipgloss.NewStyle().Foreground(colorWarn)
+
 	// The progress bar is drawn by hand rather than with bubbles/progress: its
 	// width is part of the layout arithmetic, so nothing else may decide it.
 	styleBarFill  = lipgloss.NewStyle().Foreground(colorAccent)

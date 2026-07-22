@@ -1,6 +1,7 @@
 package model_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/pyjhoop/ssh-client/internal/model"
@@ -53,5 +54,21 @@ func TestValidate(t *testing.T) {
 				t.Errorf("Validate: got err %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestFilterKeyCoversEveryColumn: the sidebar filter is one substring match, so
+// everything the user might type has to be in this one string.
+func TestFilterKeyCoversEveryColumn(t *testing.T) {
+	s := model.Server{Name: "Web-1", User: "Deploy", Host: "10.0.0.1", Group: "PROD"}
+	key := s.FilterKey()
+
+	for _, want := range []string{"web-1", "deploy", "10.0.0.1", "prod"} {
+		if !strings.Contains(key, want) {
+			t.Errorf("FilterKey() = %q, missing %q", key, want)
+		}
+	}
+	if key != strings.ToLower(key) {
+		t.Errorf("FilterKey() = %q, want it lowercased", key)
 	}
 }

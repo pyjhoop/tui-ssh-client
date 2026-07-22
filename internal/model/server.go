@@ -32,6 +32,22 @@ type Server struct {
 	Auth     AuthMethod `json:"auth"`
 	Password string     `json:"password,omitempty"` // v0: stored in plaintext
 	KeyPath  string     `json:"key_path,omitempty"`
+
+	// Group is the one-level folder this server sits in; empty means ungrouped.
+	// There is no group table — a group is just "the servers carrying this
+	// string", so renaming one moves it and the last one leaving deletes it.
+	Group string `json:"group,omitempty"`
+	// LastUsed is set when a session opens successfully, for the recent-first
+	// sort. omitempty keeps it out of files written before there was one.
+	LastUsed time.Time `json:"last_used,omitempty"`
+}
+
+// FilterKey is the haystack the sidebar filter matches against: name, user,
+// host and group in one lowercased string, so "prod db" style typing works.
+func (s Server) FilterKey() string {
+	return strings.ToLower(strings.Join([]string{
+		s.Name, s.User, s.Host, s.Group,
+	}, " "))
 }
 
 // Title is the label shown in the sidebar list.

@@ -168,6 +168,29 @@ func (s *Store) Add(srv model.Server) (model.Server, error) {
 	return srv, nil
 }
 
+// AddAll appends a batch of servers in a single write, assigning IDs as Add
+// does, and returns the resulting list. Import goes through here rather than
+// calling Add per entry: that would rewrite the whole file once per host.
+func (s *Store) AddAll(servers []model.Server) ([]model.Server, error) {
+	existing, err := s.Load()
+	if err != nil {
+		return nil, err
+	}
+	for _, srv := range servers {
+		if srv.ID == "" {
+			srv.ID = uuid.NewString()
+		}
+		if srv.Port == 0 {
+			srv.Port = model.DefaultPort
+		}
+		existing = append(existing, srv)
+	}
+	if err := s.Save(existing); err != nil {
+		return nil, err
+	}
+	return existing, nil
+}
+
 // Update replaces the entry with the same ID, keeping its position in the list.
 func (s *Store) Update(srv model.Server) error {
 	if srv.ID == "" {

@@ -358,8 +358,10 @@ func (a *App) stopReconnecting(t *sessionTab, err error) {
 // that no key ever has to be held while the app decides what it was for. A
 // shell almost never wants alt+digit, which is what makes it safe to take.
 func (a *App) tabKey(msg tea.KeyMsg) (tea.Cmd, bool) {
-	// A dialog owns the keyboard while it is up — tab switching included.
-	if a.confirm != nil || a.pending != nil || a.rename != nil || a.sftpErr != nil {
+	// A dialog owns the keyboard while it is up — tab switching included. The
+	// import preview counts as one: it is a list you are choosing from, and
+	// switching the panel out from under it would strand the selection.
+	if a.confirm != nil || a.pending != nil || a.rename != nil || a.sftpErr != nil || a.importing != nil {
 		return nil, false
 	}
 
