@@ -11,10 +11,12 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
 
 	"github.com/pyjhoop/ssh-client/internal/config"
 	"github.com/pyjhoop/ssh-client/internal/model"
+	sftppkg "github.com/pyjhoop/ssh-client/internal/sftp"
 	sshpkg "github.com/pyjhoop/ssh-client/internal/ssh"
 )
 
@@ -24,6 +26,8 @@ const (
 	focusSidebar focusArea = iota
 	focusForm
 	focusSession
+	focusLocal
+	focusRemote
 )
 
 type rightMode int
@@ -33,6 +37,7 @@ const (
 	rightForm
 	rightTerminal
 	rightError
+	rightSFTP
 )
 
 // escapeHint is the key that moves focus out of a live session.
@@ -77,9 +82,32 @@ type App struct {
 	// that is not an answer to it.
 	confirm *confirm
 
+	// SFTP state. The connection is deliberately separate from the terminal
+	// session's: closing one leaves the other alive. sftpGen plays the same role
+	// as gen — messages from a superseded connection are dropped.
+	remote         *sftppkg.Remote
+	local          filePane
+	remotePane     filePane
+	sftpGen        int
+	sftpID         string // the server the panes are attached to
+	sftpName       string
+	sftpAddr       string
+	connectingSFTP string
+
+	// drag is non-nil only while a file is being dragged between panes; pending
+	// is the transfer waiting for confirmation, whether it came from a drag or
+	// from the keyboard. busy blocks a second transfer while one is running.
+	// sftpErr is a failed connection, drawn as a card floating over the panes.
+	drag    *dragState
+	pending *transferReq
+	busy    bool
+	sftpErr error
+
 	// lastAttempt is the server the current connect is for; the error card needs
-	// it to offer retry and edit.
+	// it to offer retry and edit. lastWasSFTP says which of the two connections
+	// failed, so [r] retries the one the user actually asked for.
 	lastAttempt model.Server
+	lastWasSFTP bool
 	failErr     error
 
 	connecting string
@@ -146,6 +174,37 @@ type hostKeyPromptMsg struct {
 
 // hostKeyAnsweredMsg closes the confirm panel once the reply is on its way.
 type hostKeyAnsweredMsg struct{}
+
+// sftpConnectedMsg carries a live SFTP connection plus its first listing: the
+// home directory has to be asked for over the wire, so it cannot be resolved
+// later on the UI goroutine.
+type sftpConnectedMsg struct {
+	gen     int
+	remote  *sftppkg.Remote
+	dir     string
+	entries []model.FileEntry
+}
+
+type sftpFailedMsg struct {
+	gen int
+	err error
+}
+
+// listedMsg is a directory listing for one of the two panes.
+type listedMsg struct {
+	gen     int
+	side    focusArea
+	dir     string
+	entries []model.FileEntry
+	err     error
+}
+
+type transferDoneMsg struct {
+	gen   int
+	name  string
+	bytes int64
+	err   error
+}
 
 // ── commands ────────────────────────────────────────────────────────────────
 
@@ -234,6 +293,61 @@ func connect(store *config.Store, prompts chan<- *sshpkg.HostKeyPrompt, srv mode
 			return connectFailedMsg{gen: gen, err: err}
 		}
 		return connectedMsg{gen: gen, session: sess}
+	}
+}
+
+// connectSFTP opens the file-transfer connection and resolves the remote home
+// directory in one command. Both are network round trips, so neither can happen
+// in Update.
+func connectSFTP(store *config.Store, prompts chan<- *sshpkg.HostKeyPrompt, srv model.Server, gen int) tea.Cmd {
+	return func() tea.Msg {
+		opts := sshpkg.Options{
+			KnownHostsFiles: store.KnownHostsFiles(),
+			AppendKnownHost: store.AppendKnownHost,
+			Prompts:         prompts,
+		}
+		remote, err := sftppkg.Connect(srv, opts)
+		if err != nil {
+			return sftpFailedMsg{gen: gen, err: err}
+		}
+		dir, err := remote.Home()
+		if err != nil {
+			_ = remote.Close()
+			return sftpFailedMsg{gen: gen, err: err}
+		}
+		entries, err := remote.List(dir)
+		if err != nil {
+			// The connection is fine, the directory is not — keep it and let the
+			// pane show the error.
+			return sftpConnectedMsg{gen: gen, remote: remote, dir: dir}
+		}
+		return sftpConnectedMsg{gen: gen, remote: remote, dir: dir, entries: entries}
+	}
+}
+
+// listDir reads a directory for one pane. Local listings go through here too:
+// os.ReadDir is file IO and must not run on the UI goroutine.
+func listDir(br sftppkg.Browser, side focusArea, dir string, gen int) tea.Cmd {
+	return func() tea.Msg {
+		entries, err := br.List(dir)
+		return listedMsg{gen: gen, side: side, dir: dir, entries: entries, err: err}
+	}
+}
+
+// runTransfer performs one confirmed copy. v2 runs a single transfer at a time;
+// progress and cancellation are v3.
+func runTransfer(remote *sftppkg.Remote, req transferReq, gen int) tea.Cmd {
+	return func() tea.Msg {
+		var (
+			n   int64
+			err error
+		)
+		if req.upload {
+			n, err = sftppkg.Upload(remote, req.srcPath, req.dstPath)
+		} else {
+			n, err = sftppkg.Download(remote, req.srcPath, req.dstPath)
+		}
+		return transferDoneMsg{gen: gen, name: req.entry.Name, bytes: n, err: err}
 	}
 }
 
@@ -345,6 +459,65 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, nil
 
+	case sftpConnectedMsg:
+		if msg.gen != a.sftpGen {
+			_ = msg.remote.Close()
+			return a, nil
+		}
+		a.remote = msg.remote
+		a.remotePane.br = msg.remote
+		a.remotePane.setEntries(msg.dir, msg.entries)
+		a.connectingSFTP = ""
+		a.status = fmt.Sprintf("sftp ready · tab switches panes · %s to return to the list", escapeHint)
+		return a, nil
+
+	case sftpFailedMsg:
+		if msg.gen != a.sftpGen {
+			return a, nil
+		}
+		// The panes stay up and the card floats over them: the local side is
+		// still worth looking at, and retrying should not cost the layout.
+		a.connectingSFTP = ""
+		a.confirm = nil
+		a.sftpErr = msg.err
+		a.failErr = msg.err
+		a.focus = focusLocal
+		a.errMsg = firstLineOf(msg.err)
+		return a, nil
+
+	case listedMsg:
+		if msg.gen != a.sftpGen {
+			return a, nil
+		}
+		pane := a.pane(msg.side)
+		if pane == nil {
+			return a, nil
+		}
+		if msg.err != nil {
+			pane.dir = msg.dir
+			pane.entries = nil
+			pane.cursor, pane.offset = 0, 0
+			pane.err = firstLineOf(msg.err)
+			return a, nil
+		}
+		pane.setEntries(msg.dir, msg.entries)
+		return a, nil
+
+	case transferDoneMsg:
+		if msg.gen != a.sftpGen {
+			return a, nil
+		}
+		a.busy = false
+		if msg.err != nil {
+			a.errMsg = firstLineOf(msg.err)
+			a.status = ""
+			return a, nil
+		}
+		a.errMsg = ""
+		a.status = fmt.Sprintf("sent %s (%s)", msg.name, humanSize(msg.bytes))
+		// Show the file where it landed instead of making the user press r.
+		return a, a.refreshPanes()
+
 	case tea.MouseMsg:
 		return a, a.handleMouse(msg)
 
@@ -374,6 +547,12 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return cmd
 	}
 
+	// A transfer awaiting confirmation owns the keyboard the same way, for the
+	// same reason: nothing may reach the panes behind it.
+	if a.pending != nil {
+		return a.resolvePending(msg)
+	}
+
 	// Session focus swallows everything except the escape key: the remote shell
 	// needs ctrl+c, ctrl+d, q and friends.
 	if a.focus == focusSession {
@@ -392,6 +571,9 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 	}
 
 	switch a.focus {
+	case focusLocal, focusRemote:
+		return a.handleSFTPKey(msg)
+
 	case focusForm:
 		cmd, action := a.form.Update(msg)
 		switch action {
@@ -436,9 +618,12 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		case "q", "ctrl+c":
 			a.quitting = true
 			a.teardownSession()
+			a.teardownSFTP()
 			return tea.Quit
 		case "enter":
 			return a.activateSelection()
+		case "f":
+			return a.openSFTP()
 		case "e":
 			if it, ok := a.sidebar.Selected(); ok && !it.connect {
 				return a.editServer(it.server)
@@ -453,6 +638,10 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 			}
 			if a.rightMode == rightForm {
 				a.focus = focusForm
+				return nil
+			}
+			if a.rightMode == rightSFTP {
+				a.focus = focusLocal
 				return nil
 			}
 			return nil
@@ -498,6 +687,7 @@ func (a *App) startConnect(srv model.Server) tea.Cmd {
 	a.failErr = nil
 	a.connectedID = srv.ID
 	a.lastAttempt = srv
+	a.lastWasSFTP = false
 	a.sessionName = srv.Title()
 	a.sessionAddr = fmt.Sprintf("%s@%s", srv.User, srv.Addr())
 	a.connecting = srv.Title()
@@ -518,6 +708,9 @@ func (a *App) retryConnect() tea.Cmd {
 	}
 	if srv.Host == "" {
 		return nil
+	}
+	if a.lastWasSFTP {
+		return a.startSFTP(srv)
 	}
 	return a.startConnect(srv)
 }
@@ -641,6 +834,14 @@ func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	if a.wheelOverTerminal(msg) {
 		return nil
 	}
+	// The split view owns press, motion and release while it is up — that three
+	// step sequence is the drag. A dialog floating over the panes blocks it, the
+	// same way it blocks the keyboard.
+	if a.rightMode == rightSFTP && a.confirm == nil && a.pending == nil && a.sftpErr == nil {
+		if cmd, handled := a.handleSFTPMouse(msg); handled {
+			return cmd
+		}
+	}
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
 		if a.focus == focusSidebar {
 			return a.sidebar.Update(msg)
@@ -747,6 +948,12 @@ func (a *App) resize(width, height int) tea.Cmd {
 	cols, rows := a.rightInner()
 	a.form.setSize(cols-2*padX, rows)
 
+	// The panes share the terminal body's height budget, so all three panels
+	// still close on the same row.
+	a.local.rows, a.remotePane.rows = rows, rows
+	a.local.clampOffset()
+	a.remotePane.clampOffset()
+
 	// Reflowed history no longer lines up with the old offset, so drop back to
 	// the live screen rather than showing a scrambled past.
 	a.scrollOff = 0
@@ -812,6 +1019,22 @@ func (a *App) teardownSession() {
 	a.gen++
 }
 
+// teardownSFTP closes the file connection. It is independent of the terminal
+// session on purpose: the two are separate TCP connections.
+func (a *App) teardownSFTP() {
+	if a.remote != nil {
+		_ = a.remote.Close()
+		a.remote = nil
+	}
+	a.remotePane = filePane{rows: a.remotePane.rows}
+	a.sftpID = ""
+	a.sftpName, a.sftpAddr = "", ""
+	a.drag, a.pending = nil, nil
+	a.busy = false
+	a.sftpErr = nil
+	a.sftpGen++
+}
+
 // ── view ────────────────────────────────────────────────────────────────────
 
 func (a *App) View() string {
@@ -831,18 +1054,69 @@ func (a *App) View() string {
 	left := panelStyle(a.focus == focusSidebar).
 		Render(clampBlock(sideBody, sidebarWidth-borderSize, a.panelHeight()))
 
-	// The right panel gets a title bar of its own, mirroring the sidebar's
-	// "Servers" heading, so a live session always announces which host it is.
-	rightContent := a.rightHeader(cols) + "\n" + clampBlock(a.rightBody(cols, rows), cols, rows)
-	right := panelStyle(a.focus == focusSession || a.focus == focusForm).
-		Render(clampBlock(rightContent, cols, a.panelHeight()))
+	// The split view replaces the single right panel with two. Its dialogs float
+	// over the panes rather than replacing them, so this branch does not care
+	// whether one is up.
+	right := ""
+	if a.rightMode == rightSFTP {
+		right = a.sftpPanels(rows)
+	} else {
+		// The right panel gets a title bar of its own, mirroring the sidebar's
+		// "Servers" heading, so a live session always announces which host it is.
+		rightContent := a.rightHeader(cols) + "\n" + clampBlock(a.rightBody(cols, rows), cols, rows)
+		right = panelStyle(a.focus == focusSession || a.focus == focusForm).
+			Render(clampBlock(rightContent, cols, a.panelHeight()))
+	}
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 
 	// Every row is padded to the full width so the whole frame is one clean
 	// rectangle, margin row included.
 	margin := strings.Repeat(padLine("", a.width)+"\n", topMargin)
-	return margin + body + "\n" + padLine(a.statusLine(), a.width)
+	screen := margin + body + "\n" + padLine(a.statusLine(), a.width)
+
+	// The split view's dialogs are the only thing drawn on top of the frame.
+	if a.rightMode == rightSFTP {
+		if box, x, y := a.sftpModal(); box != "" {
+			screen = overlay(screen, box, x, y)
+		}
+	}
+	return screen
+}
+
+// ansiReset closes whatever styling a spliced fragment left open, so the piece
+// after it starts from a known state.
+const ansiReset = "\x1b[0m"
+
+// overlay splices box into base at column x, row y, leaving every row exactly
+// as wide as it was.
+//
+// This is the one place that cuts a row that already carries ANSI styling, and
+// it is why the split view can float a dialog instead of replacing a panel.
+// Each row is rebuilt as left | reset | box | reset | right, where the cuts come
+// from ansi.Truncate and ansi.TruncateLeft — both of which carry the accumulated
+// SGR state across the cut, so the part after the box keeps its colours. Both
+// pieces are then re-padded to their exact widths, because a double-width
+// grapheme straddling a cut leaves the fragment one cell short.
+func overlay(base, box string, x, y int) string {
+	lines := strings.Split(base, "\n")
+	boxLines := strings.Split(box, "\n")
+
+	for i, bl := range boxLines {
+		row := y + i
+		if row < 0 || row >= len(lines) {
+			continue
+		}
+		total := ansi.StringWidth(lines[row])
+		bw := ansi.StringWidth(bl)
+		if x < 0 || bw <= 0 || x+bw > total {
+			continue
+		}
+		left := padLine(ansi.Truncate(lines[row], x, "")+ansiReset, x)
+		right := padLine(ansi.TruncateLeft(lines[row], x+bw, ""), total-x-bw)
+		lines[row] = left + ansiReset + bl + ansiReset + right
+	}
+	return strings.Join(lines, "\n")
 }
 
 // clampBlock forces a block of styled text to exactly w columns by h rows.
@@ -894,6 +1168,12 @@ func (a *App) rightHeader(cols int) string {
 		default:
 			detail = a.sessionAddr
 		}
+	case rightSFTP:
+		title = a.sftpName
+		detail = a.sftpAddr
+		if a.connectingSFTP != "" {
+			detail = "connecting…"
+		}
 	case rightError:
 		title = "Connection failed"
 		detail = a.lastAttempt.Title()
@@ -912,7 +1192,6 @@ func (a *App) rightBody(cols, rows int) string {
 	if a.confirm != nil {
 		return inset(a.confirm.View())
 	}
-
 	switch a.rightMode {
 	case rightForm:
 		return inset(a.form.View())
@@ -929,8 +1208,9 @@ func (a *App) rightBody(cols, rows int) string {
 	default:
 		var b strings.Builder
 		b.WriteString("Pick a server on the left to open a session,\n")
+		b.WriteString("press f to browse its files,\n")
 		b.WriteString("or choose “+ Connect” to register a new one.\n\n")
-		b.WriteString(styleHint.Render("↑/↓ move · enter select · e edit · d delete · q quit"))
+		b.WriteString(styleHint.Render("↑/↓ move · enter session · f files · e edit · d delete · q quit"))
 		if a.errMsg != "" {
 			b.WriteString("\n\n")
 			b.WriteString(styleError.Render("✗ " + a.errMsg))
@@ -948,13 +1228,19 @@ func inset(s string) string {
 
 func (a *App) statusLine() string {
 	switch {
+	case a.drag != nil:
+		return styleWarning.Render("↦ " + a.drag.entry.Name + " · drop on the other pane to transfer")
+	case a.busy:
+		return styleStatus.Render("transferring…")
 	case a.warning != "":
 		return styleWarning.Render(a.warning)
 	case a.errMsg != "" && a.rightMode != rightEmpty:
 		return styleError.Render("✗ " + a.errMsg)
 	case a.status != "":
 		return styleStatus.Render(a.status)
+	case a.rightMode == rightSFTP:
+		return styleStatus.Render("tab switch pane · enter open/send · space send · r refresh · drag to transfer · " + escapeHint + " back")
 	default:
-		return styleStatus.Render("tab focus panel · " + escapeHint + " leave session · q quit")
+		return styleStatus.Render("tab focus panel · f files · " + escapeHint + " leave session · q quit")
 	}
 }

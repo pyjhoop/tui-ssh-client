@@ -5,7 +5,10 @@ package model
 import (
 	"errors"
 	"fmt"
+	"io/fs"
+	"sort"
 	"strings"
+	"time"
 )
 
 // AuthMethod is how we authenticate against a server.
@@ -89,4 +92,31 @@ func (s Server) Validate() error {
 		return fmt.Errorf("unknown auth method %q", s.Auth)
 	}
 	return nil
+}
+
+// FileEntry is one row in a file pane. The local filesystem and a remote SFTP
+// listing are both reduced to this so the two panes can be treated the same.
+type FileEntry struct {
+	Name    string
+	Size    int64
+	Mode    fs.FileMode
+	ModTime time.Time
+	IsDir   bool
+}
+
+// SortEntries orders a listing the way both panes must show it: directories
+// first, then names, case-insensitively. Sorting lives here so local and remote
+// can never drift apart.
+func SortEntries(entries []FileEntry) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		a, b := entries[i], entries[j]
+		if a.IsDir != b.IsDir {
+			return a.IsDir
+		}
+		la, lb := strings.ToLower(a.Name), strings.ToLower(b.Name)
+		if la != lb {
+			return la < lb
+		}
+		return a.Name < b.Name
+	})
 }

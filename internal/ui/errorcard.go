@@ -49,6 +49,14 @@ func errorAdvice(err error, srv model.Server) (headline, hint string, actions []
 			"Could not reach " + srv.Addr() + ". Check the hostname and that sshd is listening.",
 			retry
 
+	case errors.Is(err, sshpkg.ErrSFTP):
+		return "sftp unavailable",
+			"The login worked, but " + srv.Addr() + " would not start the sftp\n" +
+				"subsystem. That is a server-side setting (Subsystem sftp in\n" +
+				"sshd_config), so retrying will not help. The terminal session\n" +
+				"still works.",
+			[]string{"[esc] dismiss"}
+
 	case errors.Is(err, sshpkg.ErrKeyFile):
 		return "private key problem",
 			"The key could not be read or parsed:\n" + firstLineOf(err),

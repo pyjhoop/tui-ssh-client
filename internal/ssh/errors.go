@@ -20,6 +20,10 @@ var (
 	ErrHostKeyUnknown  = errors.New("host key not accepted")
 	ErrHostKeyMismatch = errors.New("host key mismatch")
 	ErrKeyFile         = errors.New("private key problem")
+	// ErrSFTP means the connection itself was fine but the server would not
+	// start the sftp subsystem — a server-side configuration problem, not
+	// something retrying or editing the entry can fix.
+	ErrSFTP = errors.New("sftp subsystem unavailable")
 )
 
 // classify wraps a raw dial error with the sentinel that says what to do about

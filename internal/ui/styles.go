@@ -45,7 +45,28 @@ var (
 	styleHint = lipgloss.NewStyle().Foreground(colorMuted).Italic(true)
 
 	styleStatus = lipgloss.NewStyle().Foreground(colorMuted)
+
+	// styleRowCursor is the highlighted row in a file pane; styleRowDragged marks
+	// the file that is currently being dragged out of it.
+	styleRowCursor = lipgloss.NewStyle().
+			Background(colorAccent).Foreground(colorBg).Bold(true)
+
+	styleRowDragged = lipgloss.NewStyle().Foreground(colorWarn)
+
+	// styleModal is the floating dialog in the split view. Its border is the
+	// accent colour so it reads as being on top of the panes, not one of them.
+	styleModal = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorAccent)
 )
+
+// dropStyle highlights a pane that is a valid drop target while a drag is in
+// flight, so the border says where the file would land.
+func dropStyle() lipgloss.Style {
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorWarn)
+}
 
 // panelStyle picks the border colour for a panel based on focus.
 func panelStyle(focused bool) lipgloss.Style {
