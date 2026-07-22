@@ -9,13 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/charmbracelet/x/vt"
 
 	"github.com/pyjhoop/ssh-client/internal/config"
 	"github.com/pyjhoop/ssh-client/internal/model"
@@ -59,23 +57,18 @@ type App struct {
 
 	width, height int
 
-	// Session state. gen is bumped on every connect so output from a previous
-	// session cannot land in the current emulator. The emulator and its input
-	// pump are created once and reused across sessions — see keyPump.
-	session     *sshpkg.Session
-	emu         *vt.Emulator
-	pump        keyPump
-	pumpStarted sync.Once
-	gen         int
-	connectedID string
-	// sessionName/sessionAddr label the terminal panel's title bar.
-	sessionName string
-	sessionAddr string
-
-	// scrollOff lifts the terminal viewport this many lines into the vt
-	// scrollback. It survives new output on purpose — the screen must not jump
-	// while you are reading history — and any keystroke drops back to 0.
-	scrollOff int
+	// Session state. Each tab owns its session, its emulator and its scroll
+	// offset; active is the one on screen, or -1 for none. gen is still one
+	// app-wide counter, bumped on every dial, and every tab remembers the value
+	// it was given — messages route by it, so output from a session that has
+	// been superseded finds no tab and is dropped.
+	//
+	// Emulators come from pool and go back to it when a tab closes: they must
+	// never be closed (see keyPump), so they are recycled instead.
+	tabs   []*sessionTab
+	active int
+	pool   termPool
+	gen    int
 
 	// hostKeys carries trust-on-first-use questions from the dialing goroutine.
 	// It is drained by the same pump pattern as session output.
@@ -117,11 +110,10 @@ type App struct {
 	lastWasSFTP bool
 	failErr     error
 
-	connecting string
-	status     string
-	errMsg     string
-	warning    string
-	quitting   bool
+	status   string
+	errMsg   string
+	warning  string
+	quitting bool
 }
 
 // New builds the root model.
@@ -130,6 +122,7 @@ func New(store *config.Store) *App {
 		store:     store,
 		focus:     focusSidebar,
 		rightMode: rightEmpty,
+		active:    -1,
 		sidebar:   newSidebar(nil, sidebarWidth-2, 10),
 		form:      newForm(40, 20),
 		hostKeys:  make(chan *sshpkg.HostKeyPrompt, 1),
@@ -172,6 +165,10 @@ type sessionEndedMsg struct {
 	gen int
 	err error
 }
+
+// reconnectMsg fires when a lost tab's backoff expires. It carries the
+// generation so an attempt the user has already forced with [r] wins.
+type reconnectMsg struct{ gen int }
 
 // hostKeyPromptMsg carries a fingerprint question from a dialing goroutine that
 // is blocked waiting for the answer.
@@ -568,32 +565,72 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case connectedMsg:
-		if msg.gen != a.gen {
-			// A newer connect superseded this one.
+		t, ok := a.tabByGen(msg.gen)
+		if !ok {
+			// A newer attempt, or a closed tab, superseded this one.
 			_ = msg.session.Close()
 			return a, nil
 		}
-		a.session = msg.session
-		a.connecting = ""
-		a.rightMode = rightTerminal
-		a.focus = focusSession
-		a.status = fmt.Sprintf("connected · %s to return to the list", escapeHint)
+		reconnected := t.attempt > 0
+		t.session = msg.session
+		t.state = tabLive
+		t.attempt = 0
+		t.until = time.Time{}
+		t.lastErr = nil
+		t.scrollOff = 0
+		if reconnected {
+			// The remote shell is a new one; the frozen screen belonged to the
+			// old. Clearing it here rather than when the connection dropped is
+			// what lets the user read it while the reconnect is in flight.
+			cols, rows := a.rightInner()
+			resetEmulator(t.emu(), cols, rows)
+		}
 		// Point the input pump at this session. Key events are encoded by the
 		// emulator, so cursor-key modes stay correct.
-		a.pump.attach(a.session)
-		return a, waitForOutput(a.session, a.gen)
+		t.slot.pump.attach(msg.session)
+		if t == a.cur() {
+			a.rightMode = rightTerminal
+			if reconnected {
+				a.status = "reconnected · new shell, the old one is gone"
+			} else {
+				a.focus = focusSession
+				a.status = fmt.Sprintf("connected · %s to return to the list", escapeHint)
+			}
+		} else {
+			t.activity = true
+		}
+		return a, waitForOutput(msg.session, t.gen)
 
 	case connectFailedMsg:
-		if msg.gen != a.gen {
+		t, ok := a.tabByGen(msg.gen)
+		if !ok {
 			return a, nil
 		}
-		a.connecting = ""
 		a.confirm = nil
+		// A reconnect that fails goes back to waiting rather than to the error
+		// card: the tab and its last screen stay, and the backoff carries on.
+		if t.attempt > 0 {
+			if errors.Is(msg.err, sshpkg.ErrHostKeyUnknown) {
+				// The one failure that must not be retried unattended.
+				a.stopReconnecting(t, msg.err)
+				return a, nil
+			}
+			return a, a.scheduleReconnect(t, msg.err)
+		}
+		// A first connect that never came up leaves nothing worth keeping.
+		a.closeTab(a.tabIndexOf(t))
 		a.rightMode = rightError
 		a.focus = focusSidebar
 		a.failErr = msg.err
 		a.errMsg = firstLineOf(msg.err)
 		return a, nil
+
+	case reconnectMsg:
+		t, ok := a.tabByGen(msg.gen)
+		if !ok || t.state != tabLost {
+			return a, nil
+		}
+		return a, a.reconnect(t, true)
 
 	case hostKeyPromptMsg:
 		return a, tea.Batch(a.askHostKey(msg.prompt), waitForHostKey(a.hostKeys))
@@ -603,19 +640,29 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case outputMsg:
-		if msg.gen != a.gen || a.emu == nil {
+		t, ok := a.tabByGen(msg.gen)
+		if !ok || t.emu() == nil {
 			return a, nil
 		}
-		_, _ = a.emu.Write(msg.data)
-		return a, waitForOutput(a.session, a.gen)
+		// Background tabs are fed exactly like the visible one — that is the
+		// whole of "the session keeps running while you look elsewhere".
+		_, _ = t.emu().Write(msg.data)
+		if t != a.cur() {
+			t.activity = true
+		}
+		return a, waitForOutput(t.session, t.gen)
 
 	case sessionEndedMsg:
-		if msg.gen != a.gen {
+		t, ok := a.tabByGen(msg.gen)
+		if !ok {
 			return a, nil
 		}
-		a.teardownSession()
-		a.rightMode = rightEmpty
-		a.focus = focusSidebar
+		// A connection that died under us is worth getting back; a shell that
+		// exited on purpose is not, or "exit" would start an endless retry loop.
+		if errors.Is(msg.err, sshpkg.ErrConnectionLost) {
+			return a, a.scheduleReconnect(t, msg.err)
+		}
+		a.closeTab(a.tabIndexOf(t))
 		if msg.err != nil {
 			a.errMsg = "session ended: " + msg.err.Error()
 		} else {
@@ -802,6 +849,13 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
+	// Tab switching works from anywhere, session focus included: alt combinations
+	// are ours, everything else the shell may still need. tabKey stands down
+	// while a dialog is up, like every other binding.
+	if cmd, handled := a.tabKey(msg); handled {
+		return cmd
+	}
+
 	// The rename input owns the keyboard the same way a confirmation does, and
 	// for the same reason — it is the newest question on screen.
 	if a.rename != nil {
@@ -835,8 +889,18 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		if a.scrollKey(msg) {
 			return nil
 		}
+		// A tab with no session behind it has nowhere to send keys, so r takes
+		// its usual meaning here: try again now, without waiting out the backoff.
+		if t := a.cur(); t != nil && t.down() {
+			if msg.String() == "r" && t.state == tabLost {
+				return a.reconnect(t, false)
+			}
+			return nil
+		}
 		// Any other key means "I am done reading history".
-		a.scrollOff = 0
+		if t := a.cur(); t != nil {
+			t.scrollOff = 0
+		}
 		a.sendKey(msg)
 		return nil
 	}
@@ -888,11 +952,18 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			a.quitting = true
-			a.teardownSession()
+			a.teardownAllSessions()
 			a.teardownSFTP() // cancels a running transfer first
 			return tea.Quit
 		case "enter":
 			return a.activateSelection()
+		case "n":
+			// A second session to a server that already has one. enter reuses
+			// the open tab, so this is the only way to ask for another.
+			if it, ok := a.sidebar.Selected(); ok && !it.connect {
+				return a.openTab(it.server, true)
+			}
+			return nil
 		case "f":
 			return a.openSFTP()
 		case "e":
@@ -903,7 +974,7 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		case "d":
 			return a.deleteSelection()
 		case "tab":
-			if a.rightMode == rightTerminal && a.session != nil {
+			if a.rightMode == rightTerminal && a.curSession() != nil {
 				a.focus = focusSession
 				return nil
 			}
@@ -939,32 +1010,19 @@ func (a *App) activateSelection() tea.Cmd {
 		return nil
 	}
 
-	// Re-selecting the server we are already attached to just returns focus.
-	if a.session != nil && a.rightMode == rightTerminal && a.connectedID == it.server.ID {
-		a.focus = focusSession
-		return nil
-	}
-
-	return a.startConnect(it.server)
+	// A server that already has a tab is shown rather than dialled again; n is
+	// how you ask for a second session to the same host.
+	return a.openTab(it.server, false)
 }
 
-// startConnect tears down whatever is running and dials srv.
-func (a *App) startConnect(srv model.Server) tea.Cmd {
-	a.teardownSession()
-	cols, rows := a.rightInner()
-	a.gen++
-	a.startTerminal(cols, rows)
-	a.scrollOff = 0
-	a.failErr = nil
-	a.connectedID = srv.ID
-	a.lastAttempt = srv
-	a.lastWasSFTP = false
-	a.sessionName = srv.Title()
-	a.sessionAddr = fmt.Sprintf("%s@%s", srv.User, srv.Addr())
-	a.connecting = srv.Title()
-	a.rightMode = rightTerminal
-	a.focus = focusSidebar
-	return connect(a.store, a.hostKeys, srv, a.gen, cols, rows)
+// tabIndexOf locates a tab by identity, since messages carry the tab itself.
+func (a *App) tabIndexOf(t *sessionTab) int {
+	for i, other := range a.tabs {
+		if other == t {
+			return i
+		}
+	}
+	return -1
 }
 
 // retryConnect re-runs the attempt the error card is about, picking up any edit
@@ -983,14 +1041,19 @@ func (a *App) retryConnect() tea.Cmd {
 	if a.lastWasSFTP {
 		return a.startSFTP(srv)
 	}
-	return a.startConnect(srv)
+	return a.openTab(srv, false)
 }
 
+// dismissError closes the card. Other sessions may still be open behind it, in
+// which case the panel goes back to showing one rather than to the placeholder.
 func (a *App) dismissError() {
 	a.rightMode = rightEmpty
 	a.failErr = nil
 	a.errMsg = ""
 	a.focus = focusSidebar
+	if len(a.tabs) > 0 {
+		a.rightMode = rightTerminal
+	}
 }
 
 func (a *App) editServer(srv model.Server) tea.Cmd {
@@ -1038,7 +1101,7 @@ func (a *App) deleteSelection() tea.Cmd {
 // is no "connect anyway" for a *changed* key — that case never reaches here,
 // the ssh package refuses it outright.
 func (a *App) askHostKey(p *sshpkg.HostKeyPrompt) tea.Cmd {
-	if a.connecting == "" {
+	if !a.dialing() {
 		// Nothing is waiting on this any more (the connect was superseded).
 		return func() tea.Msg { p.Reject(); return nil }
 	}
@@ -1082,22 +1145,36 @@ func (a *App) scrollKey(msg tea.KeyMsg) bool {
 }
 
 // scrollBy moves the viewport, clamped to what the scrollback actually holds.
+// The offset belongs to the tab, so switching away and back keeps your place.
 func (a *App) scrollBy(delta int) {
-	a.scrollOff = clampInt(a.scrollOff+delta, 0, maxScrollOffset(a.emu))
+	t := a.cur()
+	if t == nil {
+		return
+	}
+	t.scrollOff = clampInt(t.scrollOff+delta, 0, maxScrollOffset(t.emu()))
+}
+
+// scrollOffset is the visible tab's offset, or 0 when there is no tab.
+func (a *App) scrollOffset() int {
+	if t := a.cur(); t != nil {
+		return t.scrollOff
+	}
+	return 0
 }
 
 // sendKey pushes a key into the emulator, which encodes it and writes the bytes
 // to the session through the pipe drained in connectedMsg.
 func (a *App) sendKey(msg tea.KeyMsg) {
-	if a.emu == nil || a.session == nil {
+	t := a.cur()
+	if t == nil || t.emu() == nil || t.session == nil {
 		return
 	}
 	if msg.Paste {
-		a.emu.SendText(string(msg.Runes))
+		t.emu().SendText(string(msg.Runes))
 		return
 	}
 	if key, ok := keyToVT(msg); ok {
-		a.emu.SendKey(key)
+		t.emu().SendKey(key)
 	}
 }
 
@@ -1142,7 +1219,7 @@ func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		cmd, _ := a.form.Update(local)
 		return cmd
 	case rightTerminal:
-		if a.session != nil {
+		if a.curSession() != nil {
 			a.focus = focusSession
 		}
 	}
@@ -1161,15 +1238,16 @@ func (a *App) wheelOverTerminal(msg tea.MouseMsg) bool {
 	if !up && msg.Button != tea.MouseButtonWheelDown {
 		return false
 	}
-	if a.confirm != nil || a.rightMode != rightTerminal || a.emu == nil {
+	t := a.cur()
+	if a.confirm != nil || a.rightMode != rightTerminal || t == nil || t.emu() == nil {
 		return false
 	}
-	if msg.X < sidebarWidth || a.connecting != "" {
+	if msg.X < sidebarWidth || t.state == tabConnecting {
 		return false
 	}
 
-	if a.emu.IsAltScreen() {
-		altScreenScroll(a.emu, up)
+	if t.emu().IsAltScreen() {
+		altScreenScroll(t.emu(), up)
 		return true
 	}
 	if up {
@@ -1225,21 +1303,24 @@ func (a *App) resize(width, height int) tea.Cmd {
 	a.local.clampOffset()
 	a.remotePane.clampOffset()
 
-	// Reflowed history no longer lines up with the old offset, so drop back to
-	// the live screen rather than showing a scrambled past.
-	a.scrollOff = 0
-
-	if a.emu != nil {
-		a.emu.Resize(cols, rows)
-	}
-	if a.session != nil {
-		sess := a.session
-		return func() tea.Msg {
-			_ = sess.Resize(cols, rows)
-			return nil
+	// Every tab is resized, not just the visible one: a background session that
+	// kept the old geometry would be redrawn wrong the moment you switch to it.
+	var cmds []tea.Cmd
+	for _, t := range a.tabs {
+		if emu := t.emu(); emu != nil {
+			emu.Resize(cols, rows)
+		}
+		// Reflowed history no longer lines up with the old offset, so drop back
+		// to the live screen rather than showing a scrambled past.
+		t.scrollOff = 0
+		if sess := t.session; sess != nil {
+			cmds = append(cmds, func() tea.Msg {
+				_ = sess.Resize(cols, rows)
+				return nil
+			})
 		}
 	}
-	return nil
+	return tea.Batch(cmds...)
 }
 
 // The vertical budget is fixed: a top margin, the two panels, and one status
@@ -1264,30 +1345,6 @@ func (a *App) panelHeight() int {
 func (a *App) rightInner() (cols, rows int) {
 	cols = a.width - sidebarWidth - borderSize
 	return maxInt(cols, 1), maxInt(a.panelHeight()-rightHeaderRows, 1)
-}
-
-// startTerminal readies the emulator for a fresh session, starting the input
-// pump the first time round. The emulator is reused rather than recreated: see
-// keyPump for why it must never be closed.
-func (a *App) startTerminal(cols, rows int) {
-	if a.emu == nil {
-		a.emu = newEmulator(cols, rows)
-	} else {
-		resetEmulator(a.emu, cols, rows)
-	}
-	a.pumpStarted.Do(func() { go a.pump.run(a.emu) })
-}
-
-func (a *App) teardownSession() {
-	// Detach first: the pump must stop writing to a session we are closing.
-	a.pump.detach()
-	if a.session != nil {
-		_ = a.session.Close()
-		a.session = nil
-	}
-	a.connectedID = ""
-	a.sessionName, a.sessionAddr = "", ""
-	a.gen++
 }
 
 // teardownSFTP closes the file connection. It is independent of the terminal
@@ -1435,15 +1492,32 @@ func (a *App) rightHeader(cols int) string {
 			title = "Edit connection"
 		}
 	case rightTerminal:
-		title = a.sessionName
+		t := a.cur()
+		if t == nil {
+			break
+		}
+		title = t.label()
 		switch {
-		case a.connecting != "":
+		case t.state == tabConnecting:
 			detail = "connecting…"
-		case a.scrollOff > 0:
+		case t.state == tabReconnecting:
+			detail = "reconnecting…"
+		case t.state == tabLost:
+			detail = "connection lost"
+		case t.scrollOff > 0:
 			// Say so loudly: the panel is showing the past, not the live screen.
-			detail = fmt.Sprintf("SCROLL −%d", a.scrollOff)
+			detail = fmt.Sprintf("SCROLL −%d", t.scrollOff)
 		default:
-			detail = a.sessionAddr
+			detail = t.addr
+		}
+		// More than one session: the title row becomes the tab strip. It still
+		// costs exactly one row, so the body height is unchanged.
+		if len(a.tabs) > 1 {
+			line := strings.Repeat(" ", padX) + a.tabStrip(cols-2*padX)
+			if detail != "" {
+				line += styleTitleDetail.Render("  " + detail)
+			}
+			return padLine(line, cols) + "\n" + padLine("", cols)
 		}
 	case rightSFTP:
 		title = a.sftpName
@@ -1474,10 +1548,18 @@ func (a *App) rightBody(cols, rows int) string {
 		return inset(a.form.View())
 
 	case rightTerminal:
-		if a.connecting != "" {
-			return inset(fmt.Sprintf("connecting to %s…", a.connecting))
+		t := a.cur()
+		if t == nil {
+			return inset("no session")
 		}
-		return renderScrolled(a.emu, cols, rows, a.scrollOff, a.focus == focusSession && a.scrollOff == 0)
+		if t.state == tabConnecting {
+			return inset(fmt.Sprintf("connecting to %s…", t.name))
+		}
+		// A lost session keeps its last screen on purpose: it says what you were
+		// in the middle of, and the reconnect will wipe it soon enough.
+		live := t.state == tabLive
+		return renderScrolled(t.emu(), cols, rows, t.scrollOff,
+			live && a.focus == focusSession && t.scrollOff == 0)
 
 	case rightError:
 		return inset(errorCard(a.failErr, a.lastAttempt))
@@ -1515,11 +1597,17 @@ func (a *App) statusLine() string {
 		return styleWarning.Render(a.warning)
 	case a.errMsg != "" && a.rightMode != rightEmpty:
 		return styleError.Render("✗ " + a.errMsg)
+	// A session that is down owns the status line: the countdown and the way
+	// out are the only things worth saying while it is.
+	case a.rightMode == rightTerminal && a.cur() != nil && a.cur().state != tabLive:
+		return a.tabStatus(a.cur())
 	case a.status != "":
 		return styleStatus.Render(a.status)
 	case a.rightMode == rightSFTP:
 		return styleStatus.Render("tab pane · space select · t send · d delete · R rename · r refresh · drag to transfer · " + escapeHint + " back")
+	case len(a.tabs) > 1:
+		return styleStatus.Render("alt+1..9 tab · alt+←/→ cycle · alt+w close · f files · " + escapeHint + " leave session · q quit")
 	default:
-		return styleStatus.Render("tab focus panel · f files · " + escapeHint + " leave session · q quit")
+		return styleStatus.Render("tab focus panel · n new session · f files · " + escapeHint + " leave session · q quit")
 	}
 }

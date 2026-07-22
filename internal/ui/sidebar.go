@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"fmt"
+
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -14,11 +16,20 @@ const sidebarWidth = 30
 type item struct {
 	connect bool
 	server  model.Server
+	// sessions is how many tabs are open on this server, so the list can say
+	// which ones enter would switch to rather than dial.
+	sessions int
 }
 
 func (i item) Title() string {
 	if i.connect {
 		return "+ Connect"
+	}
+	switch {
+	case i.sessions > 1:
+		return fmt.Sprintf("● %s (%d)", i.server.Title(), i.sessions)
+	case i.sessions == 1:
+		return "● " + i.server.Title()
 	}
 	return i.server.Title()
 }
@@ -34,7 +45,10 @@ func (i item) FilterValue() string { return i.Title() }
 
 // sidebar is the server list on the left.
 type sidebar struct {
-	list list.Model
+	list    list.Model
+	servers []model.Server
+	// open counts sessions per server ID; the markers are rebuilt from it.
+	open map[string]int
 }
 
 func newSidebar(servers []model.Server, width, height int) sidebar {
@@ -44,7 +58,7 @@ func newSidebar(servers []model.Server, width, height int) sidebar {
 	delegate.Styles.SelectedDesc = delegate.Styles.SelectedDesc.
 		Foreground(colorAccentDim).BorderForeground(colorAccent)
 
-	l := list.New(itemsFor(servers), delegate, width, height)
+	l := list.New(itemsFor(servers, nil), delegate, width, height)
 	l.Title = "Servers"
 	l.Styles.Title = l.Styles.Title.Background(colorAccent).Foreground(colorBg)
 	l.SetShowStatusBar(false)
@@ -55,11 +69,11 @@ func newSidebar(servers []model.Server, width, height int) sidebar {
 	return sidebar{list: l}
 }
 
-func itemsFor(servers []model.Server) []list.Item {
+func itemsFor(servers []model.Server, open map[string]int) []list.Item {
 	items := make([]list.Item, 0, len(servers)+1)
 	items = append(items, item{connect: true})
 	for _, s := range servers {
-		items = append(items, item{server: s})
+		items = append(items, item{server: s, sessions: open[s.ID]})
 	}
 	return items
 }
@@ -67,10 +81,20 @@ func itemsFor(servers []model.Server) []list.Item {
 // SetServers reloads the list, keeping the cursor in range.
 func (s *sidebar) SetServers(servers []model.Server) {
 	idx := s.list.Index()
-	s.list.SetItems(itemsFor(servers))
+	s.servers = servers
+	s.list.SetItems(itemsFor(servers, s.open))
 	if idx >= len(servers)+1 {
 		idx = len(servers)
 	}
+	s.list.Select(idx)
+}
+
+// SetOpen redraws the session markers. The cursor stays where it was: this runs
+// whenever a tab opens or closes, which must never move the selection.
+func (s *sidebar) SetOpen(open map[string]int) {
+	s.open = open
+	idx := s.list.Index()
+	s.list.SetItems(itemsFor(s.servers, open))
 	s.list.Select(idx)
 }
 

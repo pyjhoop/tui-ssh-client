@@ -367,7 +367,7 @@ func otherSide(side focusArea) focusArea {
 }
 
 // openSFTP attaches the split view to the highlighted server. It mirrors
-// startConnect: bump the generation first so anything still in flight from a
+// openTab: bump the generation first so anything still in flight from a
 // previous connection is dropped when it lands.
 func (a *App) openSFTP() tea.Cmd {
 	it, ok := a.sidebar.Selected()

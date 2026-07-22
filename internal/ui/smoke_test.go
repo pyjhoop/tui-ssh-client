@@ -80,9 +80,9 @@ func TestSmoke(t *testing.T) {
 	// Terminal rendering: a bare emulator must produce exactly rows lines of
 	// cols columns.
 	cols, rows := app.rightInner()
-	app.emu = newEmulator(cols, rows)
-	_, _ = app.emu.Write([]byte("hello\r\n\x1b[31mred\x1b[0m"))
-	out := renderEmulator(app.emu, cols, rows, true)
+	emu := newEmulator(cols, rows)
+	_, _ = emu.Write([]byte("hello\r\n\x1b[31mred\x1b[0m"))
+	out := renderEmulator(emu, cols, rows, true)
 	lines := strings.Split(out, "\n")
 	if len(lines) != rows {
 		t.Fatalf("rendered %d lines, want %d", len(lines), rows)
@@ -146,10 +146,8 @@ func TestRightPanelHeaderNamesTheSession(t *testing.T) {
 		t.Errorf("form header: got %q", got)
 	}
 
-	app.rightMode = rightTerminal
-	app.sessionName = "prod-web"
-	app.sessionAddr = "deploy@10.0.0.1:22"
-	app.emu = newEmulator(app.rightInner())
+	tab := attachTab(app, "prod-web")
+	tab.addr = "deploy@10.0.0.1:22"
 
 	header := stripANSI(strings.Split(app.View(), "\n")[topMargin+1])
 	if !strings.Contains(header, "prod-web") || !strings.Contains(header, "deploy@10.0.0.1:22") {
@@ -379,21 +377,20 @@ func TestScrollOffsetClampsAndResets(t *testing.T) {
 	app := New(config.New(t.TempDir()))
 	app.resize(100, 24)
 	cols, rows := app.rightInner()
-	app.emu = newEmulator(cols, rows)
-	app.rightMode = rightTerminal
+	tab := attachTab(app, "prod-web")
 	app.focus = focusSession
 
 	for i := range 100 {
-		fmt.Fprintf(app.emu, "line %d\r\n", i)
+		fmt.Fprintf(tab.emu(), "line %d\r\n", i)
 	}
 
 	app.scrollBy(1000)
-	if app.scrollOff != app.emu.ScrollbackLen() {
-		t.Errorf("scroll offset %d should clamp to the scrollback length %d", app.scrollOff, app.emu.ScrollbackLen())
+	if app.scrollOffset() != tab.emu().ScrollbackLen() {
+		t.Errorf("scroll offset %d should clamp to the scrollback length %d", app.scrollOffset(), tab.emu().ScrollbackLen())
 	}
 	app.scrollBy(-10000)
-	if app.scrollOff != 0 {
-		t.Errorf("scroll offset %d should clamp to 0", app.scrollOff)
+	if app.scrollOffset() != 0 {
+		t.Errorf("scroll offset %d should clamp to 0", app.scrollOffset())
 	}
 
 	// The title bar has to say we are looking at the past.
@@ -405,20 +402,20 @@ func TestScrollOffsetClampsAndResets(t *testing.T) {
 
 	// shift+up scrolls without reaching the session; a plain key returns to the
 	// bottom.
-	before := app.scrollOff
+	before := app.scrollOffset()
 	app.handleKey(tea.KeyMsg{Type: tea.KeyShiftUp})
-	if app.scrollOff != before+scrollStep {
-		t.Errorf("shift+up: offset %d, want %d", app.scrollOff, before+scrollStep)
+	if app.scrollOffset() != before+scrollStep {
+		t.Errorf("shift+up: offset %d, want %d", app.scrollOffset(), before+scrollStep)
 	}
 	app.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
-	if app.scrollOff != 0 {
-		t.Errorf("any other key should jump back to the bottom, offset is %d", app.scrollOff)
+	if app.scrollOffset() != 0 {
+		t.Errorf("any other key should jump back to the bottom, offset is %d", app.scrollOffset())
 	}
 
 	app.scrollBy(5)
 	app.resize(120, 30)
-	if app.scrollOff != 0 {
-		t.Errorf("resize should reset the scroll offset, got %d", app.scrollOff)
+	if app.scrollOffset() != 0 {
+		t.Errorf("resize should reset the scroll offset, got %d", app.scrollOffset())
 	}
 }
 
@@ -427,9 +424,8 @@ func TestScrollOffsetClampsAndResets(t *testing.T) {
 func TestConfirmPanelSwallowsKeys(t *testing.T) {
 	app := New(config.New(t.TempDir()))
 	app.resize(100, 24)
-	app.rightMode = rightTerminal
+	attachTab(app, "prod-web")
 	app.focus = focusSession
-	app.emu = newEmulator(app.rightInner())
 
 	answered := 0
 	app.confirm = &confirm{
@@ -587,10 +583,11 @@ func TestErrorCardOffersActions(t *testing.T) {
 	app.servers = []model.Server{srv}
 	app.sidebar.SetServers(app.servers)
 	app.lastAttempt = srv
-	app.gen = 7
+	tab := attachTab(app, srv.Title())
+	tab.state = tabConnecting
 
 	var m tea.Model = app
-	m, _ = m.Update(connectFailedMsg{gen: 7, err: fmt.Errorf("%w: whatever the server said", sshpkg.ErrAuth)})
+	m, _ = m.Update(connectFailedMsg{gen: tab.gen, err: fmt.Errorf("%w: whatever the server said", sshpkg.ErrAuth)})
 	if app.rightMode != rightError {
 		t.Fatalf("a failed connect should show the error card, rightMode=%v", app.rightMode)
 	}

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,6 +104,106 @@ func TestOutputChannelClosesOnRemoteExit(t *testing.T) {
 	}
 }
 
+// TestKeepaliveDetectsDeadConnection covers the case that used to be invisible:
+// the transport is gone but nothing is trying to read from it, so without the
+// keepalive the session would sit there looking healthy forever.
+func TestKeepaliveDetectsDeadConnection(t *testing.T) {
+	srv := startTestServer(t)
+
+	opts := srv.trusted(t)
+	opts.Keepalive = 150 * time.Millisecond
+	sess, err := sshpkg.Connect(model.Server{
+		Host: srv.host, Port: srv.port,
+		User: "tester", Auth: model.AuthPassword, Password: "secret",
+	}, 80, 24, opts)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer sess.Close()
+
+	srv.silent.Store(true)
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case _, ok := <-sess.Output():
+			if ok {
+				continue
+			}
+			if err := sess.ExitErr(); !errors.Is(err, sshpkg.ErrConnectionLost) {
+				t.Fatalf("ExitErr = %v, want ErrConnectionLost", err)
+			}
+			return
+		case <-deadline:
+			t.Fatal("a dead connection was never reported")
+		}
+	}
+}
+
+// TestKeepaliveLeavesHealthySessionAlone is the other half: an idle session that
+// is answering must not be torn down for being quiet.
+func TestKeepaliveLeavesHealthySessionAlone(t *testing.T) {
+	srv := startTestServer(t)
+
+	opts := srv.trusted(t)
+	opts.Keepalive = 50 * time.Millisecond
+	sess, err := sshpkg.Connect(model.Server{
+		Host: srv.host, Port: srv.port,
+		User: "tester", Auth: model.AuthPassword, Password: "secret",
+	}, 80, 24, opts)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer sess.Close()
+
+	readUntil(t, sess, "banner")
+	time.Sleep(500 * time.Millisecond) // ten keepalive rounds
+
+	if err := sess.ExitErr(); err != nil {
+		t.Fatalf("a healthy session ended with %v", err)
+	}
+	if _, err := sess.Write([]byte("hello\n")); err != nil {
+		t.Fatalf("session should still be usable: %v", err)
+	}
+	if got := readUntil(t, sess, "hello"); !strings.Contains(got, "hello") {
+		t.Fatalf("echo after keepalives: %q", got)
+	}
+}
+
+// TestCleanExitIsNotConnectionLost keeps the two endings apart: only a lost
+// connection may be reconnected automatically.
+func TestCleanExitIsNotConnectionLost(t *testing.T) {
+	srv := startTestServer(t)
+
+	sess, err := sshpkg.Connect(model.Server{
+		Host: srv.host, Port: srv.port,
+		User: "tester", Auth: model.AuthPassword, Password: "secret",
+	}, 80, 24, srv.trusted(t))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.Write([]byte("exit\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case _, ok := <-sess.Output():
+			if ok {
+				continue
+			}
+			if errors.Is(sess.ExitErr(), sshpkg.ErrConnectionLost) {
+				t.Fatalf("a clean exit was reported as a lost connection: %v", sess.ExitErr())
+			}
+			return
+		case <-deadline:
+			t.Fatal("the remote exit was never reported")
+		}
+	}
+}
+
 func readUntil(t *testing.T, sess *sshpkg.Session, want string) string {
 	t.Helper()
 	var buf strings.Builder
@@ -130,6 +231,10 @@ type testServer struct {
 	port    int
 	hostKey xssh.PublicKey
 	resized chan [2]int
+	// silent makes the server stop answering global requests while leaving the
+	// TCP connection up — what a dropped link looks like from the client side,
+	// and the only thing the keepalive can tell apart from a healthy idle one.
+	silent atomic.Bool
 }
 
 // addr is what the host key callback sees and what known_hosts lines key on.
@@ -223,7 +328,16 @@ func (s *testServer) serve(conn net.Conn, cfg *xssh.ServerConfig) {
 		return
 	}
 	defer sc.Close()
-	go xssh.DiscardRequests(reqs)
+	go func() {
+		for req := range reqs {
+			if s.silent.Load() {
+				continue // no answer, ever: the link is a black hole now
+			}
+			if req.WantReply {
+				_ = req.Reply(false, nil)
+			}
+		}
+	}()
 
 	for newCh := range chans {
 		if newCh.ChannelType() != "session" {

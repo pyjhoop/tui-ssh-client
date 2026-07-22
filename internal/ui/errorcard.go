@@ -57,6 +57,12 @@ func errorAdvice(err error, srv model.Server) (headline, hint string, actions []
 				"still works.",
 			[]string{"[esc] dismiss"}
 
+	case errors.Is(err, sshpkg.ErrConnectionLost):
+		return "connection lost",
+			"The session stopped answering and was dropped:\n" + firstLineOf(err) + "\n" +
+				"Reconnecting opens a new shell — whatever was running is gone.",
+			retry
+
 	case errors.Is(err, sshpkg.ErrKeyFile):
 		return "private key problem",
 			"The key could not be read or parsed:\n" + firstLineOf(err),

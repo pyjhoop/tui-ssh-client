@@ -27,6 +27,11 @@ var (
 
 	styleTitleDetail = lipgloss.NewStyle().Foreground(colorMuted)
 
+	// styleTabIdle is a background session in the tab strip. The active one
+	// reuses styleTitleBar, so a single tab looks exactly like the title bar did
+	// before there were tabs at all.
+	styleTabIdle = lipgloss.NewStyle().Foreground(colorMuted).Padding(0, 1)
+
 	styleFormTitle = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
 
 	styleFormLabel = lipgloss.NewStyle().Foreground(colorMuted)

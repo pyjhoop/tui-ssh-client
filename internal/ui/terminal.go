@@ -29,6 +29,56 @@ func resetEmulator(emu *vt.Emulator, cols, rows int) {
 	emu.Resize(maxInt(cols, 1), maxInt(rows, 1))
 }
 
+// maxTabs is the ceiling on open sessions, and therefore on emulators and pump
+// goroutines. It lives here rather than in the tab code because the pool is what
+// actually enforces it: a slot is never destroyed, only recycled.
+const maxTabs = 8
+
+// termSlot is one emulator plus the pump goroutine draining its reply pipe.
+// Neither is ever closed — see keyPump — so a tab borrows a slot and gives it
+// back instead of creating and destroying one.
+type termSlot struct {
+	emu  *vt.Emulator
+	pump *keyPump
+}
+
+// termPool hands slots out and takes them back. Because closed tabs return
+// their slot, the number of live pump goroutines is bounded by how many sessions
+// are open at once, not by how many have been opened over the life of the
+// program.
+type termPool struct {
+	free []*termSlot
+	live int
+}
+
+// get borrows a slot sized for the panel, reporting false once maxTabs are out.
+func (p *termPool) get(cols, rows int) (*termSlot, bool) {
+	if n := len(p.free); n > 0 {
+		s := p.free[n-1]
+		p.free = p.free[:n-1]
+		resetEmulator(s.emu, cols, rows)
+		return s, true
+	}
+	if p.live >= maxTabs {
+		return nil, false
+	}
+	s := &termSlot{emu: newEmulator(cols, rows), pump: &keyPump{}}
+	p.live++
+	go s.pump.run(s.emu)
+	return s, true
+}
+
+// put returns a slot. The screen is wiped here as well as in get so a recycled
+// emulator never hands the next session the last one's output.
+func (p *termPool) put(s *termSlot) {
+	if s == nil {
+		return
+	}
+	s.pump.detach()
+	_, _ = s.emu.Write([]byte("\x1bc"))
+	p.free = append(p.free, s)
+}
+
 // keyPump owns the emulator's input pipe.
 //
 // The emulator answers terminal queries (ESC[6n and friends, which bash and vim

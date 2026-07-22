@@ -23,6 +23,16 @@ const DialTimeout = 15 * time.Second
 // readChunk is the read buffer size for the stdout pump.
 const readChunk = 32 * 1024
 
+// KeepaliveInterval is how often we poke the server, and also how long we wait
+// for the answer. Without it a connection that dies silently (laptop asleep, VPN
+// dropped, NAT entry evicted) just leaves the read goroutine blocked forever:
+// nothing ever arrives, so nothing ever reports the session as gone.
+const KeepaliveInterval = 30 * time.Second
+
+// keepaliveRequest is OpenSSH's no-op global request. Any answer at all — even
+// a refusal — proves the transport is alive.
+const keepaliveRequest = "keepalive@openssh.com"
+
 // Session is a live shell on a remote host.
 type Session struct {
 	client *xssh.Client
@@ -133,6 +143,8 @@ func Connect(srv model.Server, cols, rows int, opts Options) (*Session, error) {
 		sentRows: rows,
 	}
 
+	go s.keepalive(opts.keepaliveInterval())
+
 	var pumps sync.WaitGroup
 	pumps.Add(2)
 	go func() { defer pumps.Done(); s.pump(stdout) }()
@@ -213,6 +225,60 @@ func (s *Session) Close() error {
 		return fmt.Errorf("close client: %w", err)
 	}
 	return nil
+}
+
+// keepalive proves the connection is still there, and ends the session with
+// ErrConnectionLost when it is not.
+//
+// SendRequest has no deadline of its own and blocks on a dead transport until
+// TCP gives up, which can take minutes, so the reply is raced against a timer.
+// The stray goroutine that is still waiting for the answer ends when fail
+// closes the client under it.
+func (s *Session) keepalive(every time.Duration) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.mu.Lock()
+		closed := s.closed
+		s.mu.Unlock()
+		if closed {
+			return
+		}
+
+		answered := make(chan error, 1)
+		go func() {
+			_, _, err := s.client.SendRequest(keepaliveRequest, true, nil)
+			answered <- err
+		}()
+
+		select {
+		case err := <-answered:
+			if err != nil {
+				s.fail(fmt.Errorf("%w: %w", ErrConnectionLost, err))
+				return
+			}
+		case <-time.After(every):
+			s.fail(fmt.Errorf("%w: no keepalive reply within %s", ErrConnectionLost, every))
+			return
+		}
+	}
+}
+
+// fail records why the session is dying and then drops the transport, which
+// wakes the readers so the normal end-of-session path runs. The recorded error
+// survives: finish only fills exitErr in when it is still nil.
+func (s *Session) fail(err error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	if s.exitErr == nil {
+		s.exitErr = err
+	}
+	s.mu.Unlock()
+	_ = s.client.Close()
 }
 
 func (s *Session) pump(r io.Reader) {

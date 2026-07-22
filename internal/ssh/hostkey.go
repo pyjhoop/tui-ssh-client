@@ -53,7 +53,22 @@ type Options struct {
 	AppendKnownHost func(line string) error
 
 	// Prompts receives trust-on-first-use questions. Nil disables them.
+	//
+	// An automatic reconnect deliberately leaves this nil: approving a new host
+	// key must be something the user is looking at when it happens, so an
+	// unattended retry fails with ErrHostKeyUnknown instead of asking.
 	Prompts chan<- *HostKeyPrompt
+
+	// Keepalive overrides KeepaliveInterval. Zero means the default; tests set
+	// it short so a dead connection can be detected without waiting 30 seconds.
+	Keepalive time.Duration
+}
+
+func (o Options) keepaliveInterval() time.Duration {
+	if o.Keepalive > 0 {
+		return o.Keepalive
+	}
+	return KeepaliveInterval
 }
 
 // hostKeyCallback builds the verification callback. Its three outcomes are:

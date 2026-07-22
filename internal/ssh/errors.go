@@ -24,6 +24,11 @@ var (
 	// start the sftp subsystem — a server-side configuration problem, not
 	// something retrying or editing the entry can fix.
 	ErrSFTP = errors.New("sftp subsystem unavailable")
+	// ErrConnectionLost is a session that died under us: the keepalive got no
+	// answer, or the transport dropped. It is deliberately distinct from a clean
+	// remote exit, because only this one may be reconnected automatically —
+	// retrying an "exit" would be an endless loop.
+	ErrConnectionLost = errors.New("connection lost")
 )
 
 // classify wraps a raw dial error with the sentinel that says what to do about
@@ -32,7 +37,7 @@ func classify(err error) error {
 	if err == nil {
 		return nil
 	}
-	for _, sentinel := range []error{ErrHostKeyMismatch, ErrHostKeyUnknown, ErrKeyFile, ErrAuth, ErrTimeout, ErrUnreachable} {
+	for _, sentinel := range []error{ErrHostKeyMismatch, ErrHostKeyUnknown, ErrKeyFile, ErrAuth, ErrTimeout, ErrUnreachable, ErrConnectionLost} {
 		if errors.Is(err, sentinel) {
 			return err
 		}
