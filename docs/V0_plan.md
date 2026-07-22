@@ -100,9 +100,10 @@ type Server struct {
 - **v2**: SFTP 파일 브라우저 — 우측을 Local | Remote로 분할, 드래그 앤 드롭 전송. 상세는 `docs/V2_plan.md`. (구현 완료)
 - **v3**: SFTP 심화 — 디렉터리 재귀 전송, 진행률·취소, 다중 선택, 원격 삭제/이름변경. 상세는 `docs/V3_plan.md`. (구현 완료)
 - **v4**: 다중 세션(탭), 세션 유지·자동 재연결. 상세는 `docs/V4_plan.md`. (구현 완료)
-- **v5**: 목록 UX — 검색/필터, 그룹/폴더, `~/.ssh/config` import.
-- **v6**: 보안 — 비밀번호 OS 키체인 저장, ssh-agent, 점프호스트.
-- **v7**: 편의 — 포트포워딩, 테마/키맵 설정.
+- **v5**: 목록 UX — 검색/필터, 그룹/폴더, `~/.ssh/config` import. 상세는 `docs/V5_plan.md`.
+- **v6**: 보안·이식성 — 암호화 금고(age), ssh-agent, 비공개 레포 동기화. 상세는 `docs/V6_plan.md`.
+  (OS 키체인은 동기화와 충돌해 **금고로 대체**됐고, 점프호스트는 v7로 옮겼다.)
+- **v7**: 편의 — 포트포워딩, 점프호스트/ProxyJump, 테마/키맵 설정.
 
 ## 검증 (end-to-end)
 1. **선행**: Go 1.22+ 설치 (`go version` 확인), `go mod init` + 의존성 `go get`.
