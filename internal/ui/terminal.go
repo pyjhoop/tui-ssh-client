@@ -193,6 +193,116 @@ func renderScrolled(emu *vt.Emulator, cols, rows, offset int, showCursor bool) s
 	return strings.Join(out, "\n")
 }
 
+// renderSelected draws the same viewport as renderScrolled with the selected
+// cells reversed. The cursor is not drawn while a selection is up: reversing a
+// cell twice puts it back, so the cursor would vanish exactly where it overlaps.
+func renderSelected(emu *vt.Emulator, cols, rows, offset int, sel *selection, showCursor bool) string {
+	if sel == nil || emu == nil {
+		return renderScrolled(emu, cols, rows, offset, showCursor)
+	}
+	restore := highlightSelection(emu, cols, rows, offset, *sel)
+	defer restore()
+	return renderScrolled(emu, cols, rows, offset, false)
+}
+
+// highlightSelection flips the selected cells to reverse video and returns a
+// func that puts them back — highlightCursor's trick, over a range. The emulator
+// owns the screen here as everywhere: there is no shadow copy of the selection,
+// only cells that are briefly drawn differently.
+func highlightSelection(emu *vt.Emulator, cols, rows, offset int, sel selection) func() {
+	var undo []func()
+	from, to := sel.ordered()
+	for y := maxInt(from.y, 0); y <= minInt(to.y, rows-1); y++ {
+		startX, endX := selRange(y, from, to, cols)
+		for x := startX; x <= endX; x++ {
+			cell, set := selCell(emu, offset, x, y)
+			if cell == nil || cell.IsZero() {
+				// Nothing to reverse: either past the end of a stored scrollback
+				// line, or the tail of a double-width grapheme, which the head
+				// already draws.
+				continue
+			}
+			original := cell.Clone()
+			shown := cell.Clone()
+			if shown.Content == "" {
+				shown.Content = " "
+				shown.Width = 1
+			}
+			shown.Style.Attrs |= uv.AttrReverse
+			set(shown)
+			undo = append(undo, func() { set(original) })
+		}
+	}
+	return func() {
+		for _, f := range undo {
+			f()
+		}
+	}
+}
+
+// selectedText is the selection as plain text: no styling, trailing blanks
+// dropped, rows joined with newlines.
+//
+// Soft-wrapped lines are deliberately not rejoined. The emulator does not record
+// whether a row ran over, so guessing would splice text back together in the
+// wrong places; what is copied is what is on screen.
+func selectedText(emu *vt.Emulator, cols, rows, offset int, sel *selection) string {
+	if sel == nil || emu == nil || cols < 1 || rows < 1 {
+		return ""
+	}
+	from, to := sel.ordered()
+
+	var lines []string
+	for y := maxInt(from.y, 0); y <= minInt(to.y, rows-1); y++ {
+		startX, endX := selRange(y, from, to, cols)
+		var row strings.Builder
+		for x := startX; x <= endX; x++ {
+			cell, _ := selCell(emu, offset, x, y)
+			switch {
+			case cell == nil, cell.Content == "" && !cell.IsZero():
+				row.WriteString(" ")
+			case cell.IsZero():
+				// The tail of a double-width grapheme: its text came with the head.
+			default:
+				row.WriteString(cell.Content)
+			}
+		}
+		lines = append(lines, strings.TrimRight(row.String(), " "))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// selRange is the inclusive column span of one row of a linear selection:
+// the first row starts at the anchor, the last ends at the cursor, and the rows
+// between are whole. A rectangular (column block) selection would be a different
+// function, and is not what a terminal selection means.
+func selRange(y int, from, to point, cols int) (startX, endX int) {
+	startX, endX = 0, cols-1
+	if y == from.y {
+		startX = clampInt(from.x, 0, cols-1)
+	}
+	if y == to.y {
+		endX = clampInt(to.x, 0, cols-1)
+	}
+	return startX, endX
+}
+
+// selCell resolves a viewport cell to the storage behind it, with a setter for
+// writing it back. It is the one place that knows a visible row may come from
+// the scrollback or from the live screen — the same split renderScrolled draws.
+func selCell(emu *vt.Emulator, offset, x, y int) (*uv.Cell, func(*uv.Cell)) {
+	if offset > 0 && y < offset {
+		line := emu.ScrollbackLen() - offset + y
+		return emu.ScrollbackCellAt(x, line), func(c *uv.Cell) {
+			if p := emu.ScrollbackCellAt(x, line); p != nil {
+				*p = *c
+			}
+		}
+	}
+	sy := y - maxInt(offset, 0)
+	return emu.CellAt(x, sy), func(c *uv.Cell) { emu.SetCell(x, sy, c) }
+}
+
 // maxScrollOffset is how far back the viewport may go.
 func maxScrollOffset(emu *vt.Emulator) int {
 	if emu == nil || emu.IsAltScreen() {

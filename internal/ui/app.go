@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -153,6 +154,11 @@ type App struct {
 	lastWasSFTP bool
 	failErr     error
 
+	// clip is an OSC 52 clipboard sequence waiting to go out. View writes it as a
+	// prefix to exactly one frame and clipFlushMsg clears it: the renderer owns
+	// stdout, so the only way to send a sequence is to put it in the frame.
+	clip string
+
 	status   string
 	errMsg   string
 	warning  string
@@ -258,6 +264,11 @@ type sessionEndedMsg struct {
 	gen int
 	err error
 }
+
+// clipFlushMsg drops the clipboard sequence again, one frame after View sent it.
+// The round trip is the point: it is what keeps the escape out of every frame
+// but the one that carries it.
+type clipFlushMsg struct{}
 
 // reconnectMsg fires when a lost tab's backoff expires. It carries the
 // generation so an attempt the user has already forced with [r] wins.
@@ -809,6 +820,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		t.until = time.Time{}
 		t.lastErr = nil
 		t.scrollOff = 0
+		t.clearSelection()
 		if reconnected {
 			// The remote shell is a new one; the frozen screen belonged to the
 			// old. Clearing it here rather than when the connection dropped is
@@ -875,6 +887,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case hostKeyAnsweredMsg:
 		a.confirm = nil
+		return a, nil
+
+	case clipFlushMsg:
+		// The frame that carried the sequence has been written; anything after it
+		// must not carry it again.
+		a.clip = ""
 		return a, nil
 
 	case outputMsg:
@@ -1253,9 +1271,11 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 			}
 			return nil
 		}
-		// Any other key means "I am done reading history".
+		// Any other key means "I am done reading history" — and done with the
+		// selection, which is about to point at whatever the shell prints next.
 		if t := a.cur(); t != nil {
 			t.scrollOff = 0
+			t.clearSelection()
 		}
 		a.sendKey(msg)
 		return nil
@@ -1698,6 +1718,9 @@ func (a *App) scrollBy(delta int) {
 		return
 	}
 	t.scrollOff = clampInt(t.scrollOff+delta, 0, maxScrollOffset(t.emu()))
+	// The rows the selection pointed at now hold different text, so it goes
+	// rather than being dragged along behind the viewport.
+	t.clearSelection()
 }
 
 // scrollOffset is the visible tab's offset, or 0 when there is no tab.
@@ -1733,6 +1756,14 @@ func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	}
 	if a.wheelOverTerminal(msg) {
 		return nil
+	}
+	// A session takes press, motion and release the same way the split view does,
+	// and for the same three-stage reason — here the drag selects text rather
+	// than moving files. The two modes cannot collide: rightMode tells them apart.
+	if a.rightMode == rightTerminal && !a.modalUp() {
+		if cmd, handled := a.handleSessionMouse(msg); handled {
+			return cmd
+		}
 	}
 	// The split view owns press, motion and release while it is up — that three
 	// step sequence is the drag. A dialog floating over the panes blocks it, the
@@ -1799,6 +1830,10 @@ func (a *App) wheelOverTerminal(msg tea.MouseMsg) bool {
 	}
 
 	if t.emu().IsAltScreen() {
+		// The alt screen has no scrollback to lift the viewport into, so the wheel
+		// becomes arrow keys — and the screen under the selection is about to be
+		// redrawn by whatever they do.
+		t.clearSelection()
 		altScreenScroll(t.emu(), up)
 		return true
 	}
@@ -1808,6 +1843,127 @@ func (a *App) wheelOverTerminal(msg tea.MouseMsg) bool {
 		a.scrollBy(-scrollStep)
 	}
 	return true
+}
+
+// handleSessionMouse implements the three stages of a text selection, reporting
+// whether it consumed the event. Dragging over the session panel is the only way
+// left to grab the words on screen: turning mouse reporting on in v0 took the
+// terminal's own selection away from us, so this is paying that back.
+//
+// Which stage is which is decided by whether a drag was in flight, never by the
+// button value — terminals disagree about what a release reports (v3's lesson,
+// learned on the file panes).
+func (a *App) handleSessionMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
+	t := a.cur()
+	if t == nil || t.emu() == nil || t.state == tabConnecting {
+		return nil, false
+	}
+
+	switch msg.Action {
+	case tea.MouseActionPress:
+		if msg.Button != tea.MouseButtonLeft {
+			return nil, false
+		}
+		p, in := a.sessionCell(msg.X, msg.Y)
+		if !in {
+			return nil, false // the sidebar, or the frame around us
+		}
+		// The panel under the pointer takes focus, exactly as a plain click did
+		// before there was anything to select.
+		if t.session != nil || t.down() {
+			a.focus = focusSession
+		}
+		t.sel = &selection{anchor: p, cursor: p, active: true}
+		return nil, true
+
+	case tea.MouseActionMotion:
+		if t.sel == nil || !t.sel.active {
+			return nil, false
+		}
+		// Clamped to the panel rather than scrolling it: the viewport moving is
+		// what clears a selection, so auto-scroll would erase the drag in progress.
+		t.sel.cursor = a.clampSessionCell(msg.X, msg.Y)
+		return nil, true
+
+	case tea.MouseActionRelease:
+		if t.sel == nil || !t.sel.active {
+			return nil, false
+		}
+		t.sel.active = false
+		sel := *t.sel
+		if sel.empty() {
+			// A click is not a selection; it moved focus and that is all.
+			t.sel = nil
+			return nil, true
+		}
+		return a.copySelection(t, sel), true
+	}
+	return nil, false
+}
+
+// sessionCell maps a screen position to a cell in the session body, reporting
+// whether it landed inside. The origin is the same one the form's click
+// translation uses, minus the padding the terminal grid deliberately has none of.
+func (a *App) sessionCell(x, y int) (point, bool) {
+	cols, rows := a.rightInner()
+	p := point{x: x - sidebarWidth - 1, y: y - topMargin - 1 - rightHeaderRows}
+	if p.x < 0 || p.y < 0 || p.x >= cols || p.y >= rows {
+		return point{}, false
+	}
+	return p, true
+}
+
+// clampSessionCell is sessionCell for a drag that has left the panel: the
+// selection stops at the edge instead of following the pointer out of it.
+func (a *App) clampSessionCell(x, y int) point {
+	cols, rows := a.rightInner()
+	return point{
+		x: clampInt(x-sidebarWidth-1, 0, cols-1),
+		y: clampInt(y-topMargin-1-rightHeaderRows, 0, rows-1),
+	}
+}
+
+// clipLimit caps what one copy may put on the clipboard. OSC 52 is a single
+// escape sequence: a megabyte of it arrives as one unbroken line and stalls the
+// terminal that has to decode it.
+const clipLimit = 64 << 10
+
+// copySelection puts the selected text on the system clipboard. Copying happens
+// on release rather than on a following keypress because inside a session every
+// key belongs to the shell — an X11-style select-to-copy is the only shape that
+// does not break the v0 rule.
+func (a *App) copySelection(t *sessionTab, sel selection) tea.Cmd {
+	cols, rows := a.rightInner()
+	text := selectedText(t.emu(), cols, rows, t.scrollOff, &sel)
+	if strings.TrimSpace(text) == "" {
+		a.status = "nothing to copy"
+		return nil
+	}
+
+	text, cut := truncateClip(text)
+	// The sequence goes out as a prefix on the next frame; the flush message
+	// removes it again, so it exists in exactly one frame and never twice.
+	a.clip = ansi.SetSystemClipboard(text)
+	if cut {
+		a.status = fmt.Sprintf("copied %s (truncated)", humanSize(int64(len(text))))
+	} else {
+		a.status = "copied " + plural(strings.Count(text, "\n")+1, "line")
+	}
+	a.errMsg = ""
+	return func() tea.Msg { return clipFlushMsg{} }
+}
+
+// truncateClip cuts the text to clipLimit bytes without splitting a rune, and
+// says whether it had to.
+func truncateClip(s string) (string, bool) {
+	if len(s) <= clipLimit {
+		return s, false
+	}
+	cut := s[:clipLimit]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut, true
 }
 
 // listHeaderRows is how far the first list item sits below the top of the
@@ -1867,8 +2023,10 @@ func (a *App) resize(width, height int) tea.Cmd {
 			emu.Resize(cols, rows)
 		}
 		// Reflowed history no longer lines up with the old offset, so drop back
-		// to the live screen rather than showing a scrambled past.
+		// to the live screen rather than showing a scrambled past. The selection
+		// goes with it, for the same reason.
 		t.scrollOff = 0
+		t.clearSelection()
 		if sess := t.session; sess != nil {
 			cmds = append(cmds, func() tea.Msg {
 				_ = sess.Resize(cols, rows)
@@ -1982,6 +2140,14 @@ func (a *App) View() string {
 		if box, x, y := a.helpModal(); box != "" {
 			screen = overlay(screen, box, x, y)
 		}
+	}
+
+	// A pending clipboard write rides out as a prefix. OSC 52 is zero columns
+	// wide, so it passes through padLine and the layout invariants untouched —
+	// and writing to stdout ourselves would land in the middle of a frame the
+	// renderer owns.
+	if a.clip != "" {
+		screen = a.clip + screen
 	}
 	return screen
 }
@@ -2139,7 +2305,7 @@ func (a *App) rightBody(cols, rows int) string {
 		// A lost session keeps its last screen on purpose: it says what you were
 		// in the middle of, and the reconnect will wipe it soon enough.
 		live := t.state == tabLive
-		return renderScrolled(t.emu(), cols, rows, t.scrollOff,
+		return renderSelected(t.emu(), cols, rows, t.scrollOff, t.sel,
 			live && a.focus == focusSession && t.scrollOff == 0)
 
 	case rightError:

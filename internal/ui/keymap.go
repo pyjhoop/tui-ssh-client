@@ -85,6 +85,7 @@ const (
 	actScrollPageUp   Action = "session.scroll_page_up"
 	actScrollPageDown Action = "session.scroll_page_down"
 	actReconnect      Action = "session.reconnect"
+	actCopy           Action = "session.copy"
 
 	actTabSelect Action = "tabs.select"
 	actTabPrev   Action = "tabs.prev"
@@ -242,6 +243,10 @@ var defaultBindings = []Binding{
 	{Action: actScrollPageUp, Ctx: ctxSession, Keys: []string{"shift+pgup"}, Desc: "scroll back a page"},
 	{Action: actScrollPageDown, Ctx: ctxSession, Keys: []string{"shift+pgdown"}, Desc: "scroll forward a page"},
 	{Action: actReconnect, Ctx: ctxSession, Keys: []string{"r"}, Desc: "reconnect now, without waiting out the backoff"},
+	// Priority 0 keeps this off the status line: the line that lists session
+	// bindings is the one drawn beside the sidebar, and a gesture that only works
+	// inside a session must not be advertised where it would do nothing.
+	{Action: actCopy, Ctx: ctxSession, Keys: nil, Label: "drag", Desc: "select and copy to the clipboard (OSC 52)", Doc: true},
 
 	// ── tabs ──
 	{Action: actTabSelect, Ctx: ctxTabs, Keys: []string{"alt+1", "alt+2", "alt+3", "alt+4", "alt+5", "alt+6", "alt+7", "alt+8", "alt+9"}, Label: "alt+1..9", Desc: "switch to the nth session", Short: "tab", Priority: 25},

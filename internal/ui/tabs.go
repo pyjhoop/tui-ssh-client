@@ -65,12 +65,61 @@ type sessionTab struct {
 	// activity is output that arrived while the tab was not on screen.
 	activity bool
 
+	// sel is the mouse selection, in viewport coordinates. It is deliberately
+	// not in scrollback coordinates: the viewport is what the user dragged over,
+	// and anything that moves it (a wheel notch, a resize, a reconnect) makes the
+	// old rows mean something else — so those all clear it instead of trying to
+	// follow the text.
+	sel *selection
+
 	// attempt counts consecutive failed reconnects; until is when the next one
 	// fires, and is zero when nothing is scheduled (a host key that stopped
 	// being trusted, say — that one waits for the user).
 	attempt int
 	until   time.Time
 	lastErr error
+}
+
+// point is a cell in the session panel's body, column and row from its top-left.
+type point struct{ x, y int }
+
+// before reports whether p comes earlier than q in reading order, which is what
+// makes a drag upwards select the same text as the same drag downwards.
+func (p point) before(q point) bool {
+	if p.y != q.y {
+		return p.y < q.y
+	}
+	return p.x < q.x
+}
+
+// selection is a linear range of cells, not a rectangle: the first row runs from
+// the anchor to the end of the line, whole rows follow, and the last one stops at
+// the cursor. active is true only while the button is still down — a finished
+// selection stays on screen until something moves the viewport under it.
+type selection struct {
+	anchor, cursor point
+	active         bool
+}
+
+// ordered returns the selection with its ends in reading order.
+func (s selection) ordered() (from, to point) {
+	if s.cursor.before(s.anchor) {
+		return s.cursor, s.anchor
+	}
+	return s.anchor, s.cursor
+}
+
+// empty reports a selection of no cells at all — a plain click, which copies
+// nothing.
+func (s selection) empty() bool { return s.anchor == s.cursor }
+
+// clearSelection drops the selection. Everything that moves the viewport calls
+// it: scrolling, resizing, switching tabs, a new shell after a reconnect, and
+// the next key sent to the session.
+func (t *sessionTab) clearSelection() {
+	if t != nil {
+		t.sel = nil
+	}
 }
 
 func (t *sessionTab) emu() *vt.Emulator {
@@ -176,6 +225,8 @@ func (a *App) switchTo(i int) {
 	a.active = i
 	t := a.tabs[i]
 	t.activity = false
+	// The selection belongs to the screen that was on display when it was made.
+	t.clearSelection()
 	a.rightMode = rightTerminal
 	a.errMsg = ""
 	// A tab that is down still takes focus: it is what you are looking at, and
