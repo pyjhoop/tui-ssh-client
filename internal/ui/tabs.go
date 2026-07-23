@@ -364,31 +364,29 @@ func (a *App) tabKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	// A dialog owns the keyboard while it is up — tab switching included. The
 	// import preview counts as one: it is a list you are choosing from, and
 	// switching the panel out from under it would strand the selection.
-	if a.confirm != nil || a.pending != nil || a.rename != nil || a.sftpErr != nil ||
-		a.importing != nil || a.syncForm != nil || a.keyPass != nil || a.unlock != nil {
+	if a.modalUp() || a.help != nil {
 		return nil, false
 	}
 
 	s := msg.String()
-	switch s {
-	case "alt+left", "alt+h":
+	switch a.keys.Action(ctxTabs, s) {
+	case actTabPrev:
 		a.cycleTab(-1)
 		return nil, true
-	case "alt+right", "alt+l":
+	case actTabNext:
 		a.cycleTab(1)
 		return nil, true
-	case "alt+w":
+	case actTabClose:
 		if a.cur() == nil {
 			return nil, false
 		}
 		a.closeTab(a.active)
 		a.status = "session closed"
 		return nil, true
-	}
-
-	if n, ok := strings.CutPrefix(s, "alt+"); ok && len(n) == 1 && n[0] >= '1' && n[0] <= '9' {
-		idx := int(n[0] - '1')
-		if idx < len(a.tabs) {
+	case actTabSelect:
+		// Which tab is the position of the key within the binding, not the
+		// digit in it: rebinding the family must not break the arithmetic.
+		if idx := a.keys.KeyIndex(ctxTabs, actTabSelect, s); idx >= 0 && idx < len(a.tabs) {
 			a.switchTo(idx)
 		}
 		return nil, true

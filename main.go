@@ -24,11 +24,22 @@ func main() {
 	pull := flag.Bool("pull", false, "fetch the encrypted bundle from the sync repository before starting")
 	repo := flag.String("repo", "", "owner/name of the sync repository (only needed the first time on a machine)")
 	path := flag.String("path", ui.DefaultBundlePath, "path to the bundle inside the repository")
+	var keys keysFlag
+	flag.Var(&keys, "keys", "print the key bindings and exit; --keys=json prints them as keys.json")
 	flag.Parse()
 
 	store, err := config.Default()
 	if err != nil {
 		fail(err)
+	}
+
+	// Dumping the keymap does not start the UI: it is meant to be read, diffed
+	// and redirected into keys.json, which the TUI deliberately does not edit.
+	if keys.set {
+		if err := dumpKeys(store, keys.value); err != nil {
+			fail(err)
+		}
+		return
 	}
 
 	app := ui.New(store)
@@ -48,6 +59,45 @@ func main() {
 	if _, err := p.Run(); err != nil {
 		fail(err)
 	}
+}
+
+// keysFlag makes --keys work with and without a value: bare it prints the
+// readable table, --keys=json prints the file format. It claims to be a boolean
+// flag so the bare form does not swallow the next argument.
+type keysFlag struct {
+	set   bool
+	value string
+}
+
+func (f *keysFlag) String() string   { return f.value }
+func (f *keysFlag) IsBoolFlag() bool { return true }
+
+func (f *keysFlag) Set(v string) error {
+	f.set = true
+	switch v {
+	case "", "true", "text":
+		f.value = "text"
+	case "json":
+		f.value = "json"
+	default:
+		return fmt.Errorf("unknown format %q: use text or json", v)
+	}
+	return nil
+}
+
+// dumpKeys prints the effective keymap — defaults with keys.json applied — and
+// says on stderr what it had to refuse, so a redirect into keys.json still gets
+// a clean file.
+func dumpKeys(store *config.Store, format string) error {
+	out, problems, err := ui.KeyDump(store, format == "json")
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	for _, p := range problems {
+		fmt.Fprintln(os.Stderr, "ssh-client: keys.json:", p.String())
+	}
+	return nil
 }
 
 func fail(err error) {

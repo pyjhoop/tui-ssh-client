@@ -447,65 +447,65 @@ func (a *App) handleSFTPKey(msg tea.KeyMsg) tea.Cmd {
 	// confirm panel: keys it does not recognise are dropped rather than reaching
 	// the panes behind it.
 	if a.sftpErr != nil {
-		switch msg.String() {
-		case "r":
+		switch a.keys.Action(ctxError, msg.String()) {
+		case actErrorRetry:
 			return a.retryConnect()
-		case "e":
+		case actErrorEdit:
 			srv := a.lastAttempt
 			a.dismissSFTPError()
 			return a.editServer(srv)
-		case "esc":
+		case actErrorDismiss:
 			a.dismissSFTPError()
 		}
 		return nil
 	}
 
-	switch msg.String() {
-	case escapeHint, "esc":
+	switch a.keys.Action(ctxSFTP, msg.String()) {
+	case actSFTPBack:
 		a.focus = focusSidebar
 		a.status = "sftp still connected · f to go back"
 		return nil
 
-	case "tab", "left", "right", "h", "l":
+	case actSFTPSwitchPane:
 		a.focus = otherSide(side)
 		return nil
 
-	case " ":
+	case actSFTPMark:
 		pane.toggleMark()
 		pane.moveCursor(1)
 
-	case "a":
+	case actSFTPClearMarks:
 		pane.clearMarks()
 
-	case "t":
+	case actSFTPTransfer:
 		return a.buildTransfer(side, pane.targets())
 
-	case "d":
+	case actSFTPDelete:
 		return a.startDelete(side)
 
-	case "R":
+	case actSFTPRename:
 		a.startRename(side)
 
-	case "up", "k":
+	case actSFTPUp:
 		pane.moveCursor(-1)
-	case "down", "j":
+	case actSFTPDown:
 		pane.moveCursor(1)
-	case "pgup":
+	case actSFTPPageUp:
 		pane.moveCursor(-maxInt(pane.rows-1, 1))
-	case "pgdown":
+	case actSFTPPageDown:
 		pane.moveCursor(maxInt(pane.rows-1, 1))
-	case "home":
+	case actSFTPHome:
 		pane.moveCursor(-len(pane.entries))
-	case "end":
+	case actSFTPEnd:
 		pane.moveCursor(len(pane.entries))
 
-	case "backspace":
+	case actSFTPParent:
 		return a.openDir(side, pane.br.Parent(pane.dir))
 
-	case "r":
+	case actSFTPRefresh:
 		return listDir(pane.br, side, pane.dir, a.sftpGen)
 
-	case "enter":
+	case actSFTPOpen:
 		e, ok := pane.selected()
 		if !ok {
 			return nil
@@ -590,10 +590,10 @@ func copyable(entries []model.FileEntry) []model.FileEntry {
 // resolvePending answers the transfer alert. Like the confirm panel, keys it
 // does not recognise are dropped rather than forwarded.
 func (a *App) resolvePending(msg tea.KeyMsg) tea.Cmd {
-	switch msg.String() {
-	case "enter", "y", "Y":
+	switch a.keys.Action(ctxConfirm, msg.String()) {
+	case actConfirmYes:
 		return a.startTransfer(*a.pending)
-	case "esc", "n", "N", "q", "ctrl+c":
+	case actConfirmNo:
 		a.pending = nil
 		a.status = "transfer cancelled"
 	}
@@ -881,7 +881,13 @@ func (a *App) sftpModal() (box string, x, y int) {
 	default:
 		return "", 0, 0
 	}
+	return modalBox(a, content)
+}
 
+// modalBox frames content as a floating card and says where to splice it. It is
+// shared with the help card: there is one set of rules for a box that floats
+// over the frame, and they live here.
+func modalBox(a *App, content string) (box string, x, y int) {
 	// The box may not outgrow the frame it floats in, borders included.
 	maxCols := maxInt(a.width-2*borderSize-2, modalMinCols)
 	maxRows := maxInt(a.panelHeight()-2, 1)
@@ -1058,7 +1064,7 @@ func (a *App) transferStatus() string {
 	}
 
 	head := arrow + " " + name + "  "
-	barCols := a.width - ansi.StringWidth(head) - ansi.StringWidth(right) - ansi.StringWidth(tail)
+	barCols := a.statusRoom() - ansi.StringWidth(head) - ansi.StringWidth(right) - ansi.StringWidth(tail)
 	if barCols < 8 {
 		// Too narrow for a bar: the numbers matter more than the picture.
 		return styleStatus.Render(head + strings.TrimSpace(right) + tail)

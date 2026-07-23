@@ -238,7 +238,7 @@ func TestPullAsksBeforeReplacing(t *testing.T) {
 	}
 
 	// Saying no leaves everything alone.
-	cmd, _ := app.confirm.resolve(tea.KeyMsg{Type: tea.KeyEsc})
+	cmd, _ := app.confirm.resolve(app.keys, tea.KeyMsg{Type: tea.KeyEsc})
 	app.confirm = nil
 	if cmd != nil {
 		m = drain(t, m, cmd)
@@ -252,7 +252,7 @@ func TestPullAsksBeforeReplacing(t *testing.T) {
 	if app.confirm == nil {
 		t.Fatal("no confirmation the second time")
 	}
-	cmd, _ = app.confirm.resolve(tea.KeyMsg{Type: tea.KeyEnter})
+	cmd, _ = app.confirm.resolve(app.keys, tea.KeyMsg{Type: tea.KeyEnter})
 	app.confirm = nil
 	m = drain(t, m, cmd)
 
@@ -293,7 +293,7 @@ func TestPullKeepsOpenTabs(t *testing.T) {
 	if app.confirm == nil {
 		t.Fatalf("a pull must ask first · status=%q err=%q", app.status, app.errMsg)
 	}
-	cmd, _ := app.confirm.resolve(tea.KeyMsg{Type: tea.KeyEnter})
+	cmd, _ := app.confirm.resolve(app.keys, tea.KeyMsg{Type: tea.KeyEnter})
 	app.confirm = nil
 	m = drain(t, m, cmd)
 

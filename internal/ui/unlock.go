@@ -187,12 +187,12 @@ func (a *App) handleUnlockKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
-	switch msg.String() {
-	case "ctrl+c":
+	switch a.keys.Action(ctxUnlock, msg.String()) {
+	case actUnlockQuit:
 		a.quitting = true
 		return tea.Quit
 
-	case "esc":
+	case actUnlockCancel:
 		// Backing out is only possible when the gate is not the startup one:
 		// there is nothing behind it at startup to back out to.
 		if u.after == nil && u.mode == unlockOpen && !u.plaintext.Any() {
@@ -205,14 +205,14 @@ func (a *App) handleUnlockKey(msg tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 
-	case "tab", "down", "shift+tab", "up":
+	case actUnlockField:
 		if u.mode == unlockCreate {
 			u.second = !u.second
 			u.focusCurrent()
 		}
 		return nil
 
-	case "enter":
+	case actUnlockSubmit:
 		return a.submitUnlock()
 	}
 

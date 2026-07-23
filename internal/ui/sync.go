@@ -314,17 +314,17 @@ func (a *App) handleSyncKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
-	switch msg.String() {
-	case "esc":
+	switch a.keys.Action(ctxSync, msg.String()) {
+	case actSyncCancel:
 		a.closeSync()
 		return nil
-	case "tab", "down":
+	case actSyncNext:
 		f.move(1)
 		return nil
-	case "shift+tab", "up":
+	case actSyncPrev:
 		f.move(-1)
 		return nil
-	case "enter":
+	case actSyncSubmit:
 		auth, err := f.auth(a.secrets.GitHub)
 		if err != nil {
 			f.err = err.Error()

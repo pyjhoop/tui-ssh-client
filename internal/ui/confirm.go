@@ -25,11 +25,11 @@ type confirm struct {
 // resolve answers the dialog. It reports the command to run and whether the key
 // was one the dialog handles; anything else is swallowed so a stray keystroke
 // cannot leak into the session behind it.
-func (c *confirm) resolve(msg tea.KeyMsg) (tea.Cmd, bool) {
-	switch msg.String() {
-	case "enter", "y", "Y":
+func (c *confirm) resolve(keys *Keymap, msg tea.KeyMsg) (tea.Cmd, bool) {
+	switch keys.Action(ctxConfirm, msg.String()) {
+	case actConfirmYes:
 		return c.onYes, true
-	case "esc", "n", "N", "q", "ctrl+c":
+	case actConfirmNo:
 		return c.onNo, true
 	}
 	return nil, false

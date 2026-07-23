@@ -947,7 +947,7 @@ func TestDeleteCountsBeforeAsking(t *testing.T) {
 		}
 	}
 
-	cmd, handled := app.confirm.resolve(tea.KeyMsg{Type: tea.KeyEnter})
+	cmd, handled := app.confirm.resolve(app.keys, tea.KeyMsg{Type: tea.KeyEnter})
 	if !handled || cmd == nil {
 		t.Fatal("enter should confirm the delete")
 	}

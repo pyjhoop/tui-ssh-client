@@ -60,6 +60,17 @@ type App struct {
 	focus     focusArea
 	rightMode rightMode
 
+	// keys is the one place a key is written down. The handlers switch on the
+	// actions it resolves, the status line and the help card render it, and
+	// keys.json overlays it — so a shortcut that exists is documented and a
+	// documented one exists.
+	//
+	// help is the floating card. It is a modal like any other, and the lightest
+	// of them: it changes nothing, so closing it restores nothing.
+	keys        *Keymap
+	help        *helpState
+	keyProblems []KeymapProblem
+
 	width, height int
 
 	// Session state. Each tab owns its session, its emulator and its scroll
@@ -158,6 +169,7 @@ func New(store *config.Store) *App {
 		sidebar:   newSidebar(nil, sidebarWidth-2, 10),
 		form:      newForm(40, 20),
 		hostKeys:  make(chan *sshpkg.HostKeyPrompt, 1),
+		keys:      DefaultKeymap(),
 	}
 }
 
@@ -165,6 +177,7 @@ func (a *App) Init() tea.Cmd {
 	return tea.Batch(
 		loadServers(a.store),
 		loadUIState(a.store),
+		loadKeymap(a.store),
 		scanStartup(a.store),
 		waitForHostKey(a.hostKeys),
 	)
@@ -202,6 +215,13 @@ type serverSavedMsg struct {
 // uiStateLoadedMsg carries the fold and sort preferences. It has no error field
 // on purpose: a missing or unreadable ui.json is a normal startup.
 type uiStateLoadedMsg struct{ state config.UIState }
+
+// keymapLoadedMsg carries keys.json. Unlike ui.json it does have an error
+// field: a keymap the user wrote and we could not read is worth saying out loud.
+type keymapLoadedMsg struct {
+	keys map[string][]string
+	err  error
+}
 
 // sshConfigParsedMsg is the result of reading ~/.ssh/config for the import
 // preview. Parsing is file IO, so it never happens inside Update.
@@ -341,6 +361,13 @@ func loadServers(store *config.Store) tea.Cmd {
 func loadUIState(store *config.Store) tea.Cmd {
 	return func() tea.Msg {
 		return uiStateLoadedMsg{state: store.LoadUIState()}
+	}
+}
+
+func loadKeymap(store *config.Store) tea.Cmd {
+	return func() tea.Msg {
+		keys, err := store.LoadKeys()
+		return keymapLoadedMsg{keys: keys, err: err}
 	}
 }
 
@@ -694,6 +721,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case uiStateLoadedMsg:
 		a.sidebar.SetCollapsed(msg.state.Collapsed)
 		a.sidebar.SetSortRecent(msg.state.SortRecent)
+		return a, nil
+
+	case keymapLoadedMsg:
+		a.applyKeymap(msg)
 		return a, nil
 
 	case sshConfigParsedMsg:
@@ -1130,6 +1161,13 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return a.handleKeyPassKey(msg)
 	}
 
+	// The help card is a modal too — the lightest one, since any key it does not
+	// use closes it. It never opens over another dialog, so nothing is stacked
+	// under this branch.
+	if a.help != nil {
+		return a.handleHelpKey(msg)
+	}
+
 	// ctrl+c means "stop the transfer", not "quit", while one is running. The
 	// session branch below still gets it when the shell is focused: a remote
 	// program needs its own interrupt.
@@ -1173,7 +1211,7 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// A confirmation owns the keyboard while it is up. Unhandled keys are
 	// dropped rather than forwarded, so nothing leaks into the session behind it.
 	if a.confirm != nil {
-		cmd, handled := a.confirm.resolve(msg)
+		cmd, handled := a.confirm.resolve(a.keys, msg)
 		if handled {
 			a.confirm = nil
 		}
@@ -1186,21 +1224,31 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return a.resolvePending(msg)
 	}
 
+	// ? opens the shortcut card — but only where the key is ours to take. In a
+	// session it belongs to the shell, in a text field it is a character, and
+	// over a dialog nothing may be stacked. helpAvailable is the same question
+	// the status line asks before it advertises the key.
+	if a.helpAvailable() && a.keys.Action(ctxGlobal, msg.String()) == actHelp {
+		a.openHelp()
+		return nil
+	}
+
 	// Session focus swallows everything except the escape key: the remote shell
 	// needs ctrl+c, ctrl+d, q and friends.
 	if a.focus == focusSession {
-		if msg.Type == tea.KeyCtrlB {
+		act := a.keys.Action(ctxSession, msg.String())
+		if act == actEscape {
 			a.focus = focusSidebar
 			a.status = "session still running · select it again to go back"
 			return nil
 		}
-		if a.scrollKey(msg) {
+		if a.scrollKey(act) {
 			return nil
 		}
 		// A tab with no session behind it has nowhere to send keys, so r takes
 		// its usual meaning here: try again now, without waiting out the backoff.
 		if t := a.cur(); t != nil && t.down() {
-			if msg.String() == "r" && t.state == tabLost {
+			if act == actReconnect && t.state == tabLost {
 				return a.reconnect(t, false)
 			}
 			return nil
@@ -1243,48 +1291,51 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		// The error card offers its own actions; they take precedence over the
 		// list's while it is showing.
 		if a.rightMode == rightError {
-			switch msg.String() {
-			case "r":
+			switch a.keys.Action(ctxError, msg.String()) {
+			case actErrorRetry:
 				return a.retryConnect()
-			case "e":
+			case actErrorEdit:
 				return a.editServer(a.lastAttempt)
-			case "esc":
+			case actErrorDismiss:
 				a.dismissError()
 				return nil
 			}
 		}
 
-		switch msg.String() {
-		case "q", "ctrl+c":
+		if a.keys.Action(ctxGlobal, msg.String()) == actQuit {
 			a.quitting = true
 			a.teardownAllSessions()
 			a.teardownSFTP() // cancels a running transfer first
 			return tea.Quit
-		case "enter":
+		}
+
+		switch a.keys.Action(ctxSidebar, msg.String()) {
+		case actConnect:
 			return a.activateSelection()
-		case " ":
+		case actToggleGroup:
 			// Only meaningful on a header; on a server row the list keeps its
 			// own handling of the key.
 			if cmd, ok := a.toggleGroup(); ok {
 				return cmd
 			}
-		case "left", "right":
+		case actFoldGroup, actUnfoldGroup:
 			// A direction says which way to fold, unlike the toggles above.
 			if it, ok := a.sidebar.Selected(); ok && it.header {
-				if a.sidebar.SetGroupCollapsed(msg.String() == "left") {
+				fold := a.keys.Action(ctxSidebar, msg.String()) == actFoldGroup
+				if a.sidebar.SetGroupCollapsed(fold) {
 					return a.persistUIState()
 				}
 				return nil
 			}
-		case "i":
+		case actImport:
 			return a.openImport()
-		case "Y":
+		case actSyncSetup:
 			return a.openSync()
-		case "S":
+		case actSyncPush:
 			return a.startPush()
-		case "P":
+		case actSyncPull:
 			return a.startPull()
-		case "s":
+		case actSortRecent:
 			a.sidebar.SetSortRecent(!a.sidebar.SortRecent())
 			if a.sidebar.SortRecent() {
 				a.status = "sorted by last used"
@@ -1292,23 +1343,23 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 				a.status = "sorted by saved order"
 			}
 			return a.persistUIState()
-		case "n":
+		case actNewSession:
 			// A second session to a server that already has one. enter reuses
 			// the open tab, so this is the only way to ask for another.
 			if it, ok := a.sidebar.Selected(); ok && a.isServerRow(it) {
 				return a.openTab(it.server, true)
 			}
 			return nil
-		case "f":
+		case actOpenFiles:
 			return a.openSFTP()
-		case "e":
+		case actEditServer:
 			if it, ok := a.sidebar.Selected(); ok && a.isServerRow(it) {
 				return a.editServer(it.server)
 			}
 			return nil
-		case "d":
+		case actDeleteEntry:
 			return a.deleteSelection()
-		case "tab":
+		case actFocusPanel:
 			if a.rightMode == rightTerminal && a.curSession() != nil {
 				a.focus = focusSession
 				return nil
@@ -1464,6 +1515,25 @@ func (a *App) toggleGroup() (tea.Cmd, bool) {
 	return a.persistUIState(), true
 }
 
+// applyKeymap overlays keys.json on the defaults and keeps whatever it had to
+// refuse. The problems are said once on the status line and then live in the
+// help card, which is the only place they stay readable: a user who rebound a
+// key and did not get it needs to be told, and told where to look.
+func (a *App) applyKeymap(msg keymapLoadedMsg) {
+	a.keys = DefaultKeymap()
+	a.keyProblems = nil
+
+	if msg.err != nil {
+		a.keyProblems = []KeymapProblem{{Action: "keys.json", Reason: firstLineOf(msg.err)}}
+	} else {
+		a.keyProblems = a.keys.Apply(msg.keys)
+	}
+	if len(a.keyProblems) > 0 && a.status == "" {
+		a.status = fmt.Sprintf("keys.json: %s — press %s for details, defaults kept",
+			plural(len(a.keyProblems), "problem"), a.keys.Key(ctxGlobal, actHelp))
+	}
+}
+
 // persistUIState mirrors the sidebar's view preferences to ui.json.
 func (a *App) persistUIState() tea.Cmd {
 	return saveUIState(a.store, config.UIState{
@@ -1505,19 +1575,19 @@ func (a *App) handleImportKey(msg tea.KeyMsg) tea.Cmd {
 		a.focus = focusSidebar
 		return nil
 	}
-	switch msg.String() {
-	case "esc", "q", "ctrl+c":
+	switch a.keys.Action(ctxImport, msg.String()) {
+	case actImportCancel:
 		a.closeImport()
 		a.status = "import cancelled"
-	case "up", "k":
+	case actImportUp:
 		im.move(-1)
-	case "down", "j":
+	case actImportDown:
 		im.move(1)
-	case " ":
+	case actImportToggle:
 		im.toggle()
-	case "a":
+	case actImportToggleAll:
 		im.toggleAll()
-	case "enter":
+	case actImportAccept:
 		chosen := im.selected()
 		if len(chosen) == 0 {
 			a.closeImport()
@@ -1603,16 +1673,16 @@ func (a *App) askHostKey(p *sshpkg.HostKeyPrompt) tea.Cmd {
 // scrollKey handles the scrollback bindings, reporting whether it consumed the
 // key. Terminals normally eat shift+pgup themselves, and Bubble Tea v1 has no
 // key type for it, so shift+up/down is the binding that actually works here.
-func (a *App) scrollKey(msg tea.KeyMsg) bool {
+func (a *App) scrollKey(act Action) bool {
 	_, rows := a.rightInner()
-	switch msg.String() {
-	case "shift+up":
+	switch act {
+	case actScrollUp:
 		a.scrollBy(scrollStep)
-	case "shift+down":
+	case actScrollDown:
 		a.scrollBy(-scrollStep)
-	case "shift+pgup":
+	case actScrollPageUp:
 		a.scrollBy(maxInt(rows/2, 1))
-	case "shift+pgdown":
+	case actScrollPageDown:
 		a.scrollBy(-maxInt(rows/2, 1))
 	default:
 		return false
@@ -1655,6 +1725,12 @@ func (a *App) sendKey(msg tea.KeyMsg) {
 }
 
 func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
+	// The card blocks the mouse the same way it blocks the keyboard: a click
+	// through it would move focus behind a dialog the user can still see.
+	if a.help != nil {
+		a.helpMouse(msg)
+		return nil
+	}
 	if a.wheelOverTerminal(msg) {
 		return nil
 	}
@@ -1894,9 +1970,16 @@ func (a *App) View() string {
 	margin := strings.Repeat(padLine("", a.width)+"\n", topMargin)
 	screen := margin + body + "\n" + padLine(a.statusLine(), a.width)
 
-	// The split view's dialogs are the only thing drawn on top of the frame.
+	// The split view's dialogs float over the frame; so does the help card, from
+	// any mode. It is the first general use of overlay, and it follows the same
+	// width rules — a box that will not fit is not drawn at all.
 	if a.rightMode == rightSFTP {
 		if box, x, y := a.sftpModal(); box != "" {
+			screen = overlay(screen, box, x, y)
+		}
+	}
+	if a.help != nil && a.helpFits() {
+		if box, x, y := a.helpModal(); box != "" {
 			screen = overlay(screen, box, x, y)
 		}
 	}
@@ -2098,7 +2181,91 @@ func inset(s string) string {
 	return lipgloss.NewStyle().PaddingLeft(padX).Render(s)
 }
 
+// statusLine composes the bar as [message … help cell].
+//
+// Until v7 this was a single switch, so a warning, a transfer or an error took
+// the whole line and the shortcut hints vanished with it — which is how the one
+// key that shows all the others disappeared exactly when it was most wanted.
+// The message keeps that switch; the help cell is pinned to the right edge and
+// is dropped last, after the message has been truncated to make room for it.
 func (a *App) statusLine() string {
+	msg := a.statusMessage()
+	cell := a.helpCell()
+
+	// Without a width there is nothing to arrange against: tests and the first
+	// frame both land here.
+	if a.width <= 0 {
+		return msg
+	}
+	if cell == "" {
+		// Still trimmed here rather than left to padLine, so the cut is ours
+		// and ends in an ellipsis instead of mid-word.
+		if ansi.StringWidth(msg) > a.width {
+			msg = ansi.Truncate(msg, a.width, "…")
+		}
+		return msg
+	}
+	cellW := ansi.StringWidth(cell)
+	if a.width < cellW+statusMinMessage {
+		// Too narrow for both. A line with no message at all is worse than one
+		// with no hint, so this is the single case where the cell gives way.
+		return msg
+	}
+
+	room := a.width - cellW - 1
+	if ansi.StringWidth(msg) > room {
+		msg = ansi.Truncate(msg, room, "…")
+	}
+	gap := maxInt(a.width-ansi.StringWidth(msg)-cellW, 1)
+	return msg + strings.Repeat(" ", gap) + cell
+}
+
+// statusMinMessage is how much room the message must keep for the help cell to
+// be worth pinning.
+const statusMinMessage = 12
+
+// statusRoom is how wide the message half of the status bar may be. Anything
+// that sizes itself to the bar — the hint line, the progress bar — asks here
+// rather than using a.width, or it would be built to overflow and then be cut.
+func (a *App) statusRoom() int {
+	if a.width <= 0 {
+		return 0
+	}
+	cell := ansi.StringWidth(a.helpCell())
+	if cell == 0 || a.width < cell+statusMinMessage {
+		return a.width
+	}
+	return a.width - cell - 1
+}
+
+// helpCell is the right-hand end of the status bar. It advertises the help key
+// only where that key would actually work: inside a session it belongs to the
+// shell, and over a dialog nothing may be opened at all. A key on screen that
+// does nothing when pressed is worse than no hint.
+func (a *App) helpCell() string {
+	key := a.keys.Key(ctxGlobal, actHelp)
+	if key == "" {
+		return ""
+	}
+	switch {
+	case a.help != nil:
+		return styleHint.Render("esc close · / search")
+	case a.modalUp():
+		return "" // the card on screen already shows its own answers
+	case a.focus == focusSession:
+		// ? is the shell's here, so the cell says how to get to it.
+		return styleHint.Render(a.keys.Key(ctxSession, actEscape) + " " + key + " help")
+	case a.focus == focusForm:
+		return "" // every key is going into a text field
+	case a.focus == focusSidebar && a.sidebar.Filtering():
+		return ""
+	case !a.helpFits():
+		return "" // no room to float the card, so no reason to name the key
+	}
+	return styleHint.Render(key + " help")
+}
+
+func (a *App) statusMessage() string {
 	switch {
 	case a.transfer != nil:
 		return a.transferStatus()
@@ -2117,16 +2284,69 @@ func (a *App) statusLine() string {
 	case a.status != "":
 		return styleStatus.Render(a.status)
 	case a.sidebar.Filtering():
+		// The filter is the list's own input, not a set of bindings, so this one
+		// line stays written out.
 		return styleStatus.Render("type to filter · enter keep results · esc clear")
 	case a.rightMode == rightImport:
-		return styleStatus.Render("space select · a all/none · enter import · esc cancel")
+		return a.hintFor(ctxImport)
 	case a.rightMode == rightSync:
-		return styleStatus.Render("tab move · enter check and save · esc cancel")
+		return a.hintFor(ctxSync)
 	case a.rightMode == rightSFTP:
-		return styleStatus.Render("tab pane · space select · t send · d delete · R rename · r refresh · drag to transfer · " + escapeHint + " back")
+		return a.hintFor(ctxSFTP)
 	case len(a.tabs) > 1:
-		return styleStatus.Render("alt+1..9 tab · alt+←/→ cycle · alt+w close · f files · " + escapeHint + " leave session · q quit")
+		return a.hintFor(ctxTabs, ctxSidebar, ctxSession, ctxGlobal)
 	default:
-		return styleStatus.Render("tab focus panel · n new session · f files · " + escapeHint + " leave session · q quit")
+		return a.hintFor(ctxSidebar, ctxSession, ctxGlobal)
 	}
+}
+
+// hintFor builds the shortcut line from the bindings themselves, so it cannot
+// drift from what the keys actually do. Bindings appear in declaration order,
+// and when the line does not fit the lowest-priority one goes first — the help
+// cell statusLine pins is not part of this budget and never competes with it.
+func (a *App) hintFor(ctxs ...Context) string {
+	type item struct {
+		text     string
+		priority int
+	}
+	var items []item
+	for _, ctx := range ctxs {
+		for _, b := range a.keys.Bindings(ctx) {
+			if b.Priority <= 0 || b.Short == "" {
+				continue
+			}
+			items = append(items, item{text: b.KeyList() + " " + b.Short, priority: b.Priority})
+		}
+	}
+	if len(items) == 0 {
+		return ""
+	}
+
+	// Room for the hint is what the help cell leaves. Working it out here is
+	// what keeps lipgloss from cutting a sentence in half at the frame edge.
+	room := a.statusRoom()
+	if a.width <= 0 {
+		room = 1 << 30
+	}
+
+	join := func(items []item) string {
+		parts := make([]string, len(items))
+		for i, it := range items {
+			parts[i] = it.text
+		}
+		return strings.Join(parts, " · ")
+	}
+
+	for len(items) > 1 && ansi.StringWidth(join(items)) > room {
+		// Drop the least important, scanning from the right so that ties lose
+		// the one furthest from the front of the line.
+		worst := 0
+		for i, it := range items {
+			if it.priority <= items[worst].priority {
+				worst = i
+			}
+		}
+		items = append(items[:worst], items[worst+1:]...)
+	}
+	return styleStatus.Render(join(items))
 }

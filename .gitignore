@@ -14,6 +14,9 @@ ssh-client.age
 ssh-client.local.bak
 ui.json
 ui.json.tmp
+# keys.json 은 비밀이 아니라 사용자의 키 바인딩이지만, 같은 이유로 레포에
+# 떨어질 수 있다 — 이 기기의 설정이지 프로젝트의 것이 아니다.
+keys.json
 known_hosts
 known_hosts.tmp
 .plaintext-warning-ack
