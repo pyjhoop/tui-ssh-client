@@ -3,6 +3,8 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/pyjhoop/ssh-client/internal/config"
@@ -25,7 +27,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	s := config.New(t.TempDir())
 
 	want := []model.Server{
-		{ID: "a", Name: "prod", Host: "example.com", Port: 22, User: "root", Auth: model.AuthPassword, Password: "hunter2"},
+		{ID: "a", Name: "prod", Host: "example.com", Port: 22, User: "root", Auth: model.AuthPassword},
 		{ID: "b", Host: "10.0.0.4", Port: 2222, User: "deploy", Auth: model.AuthKey, KeyPath: "/keys/b.pem"},
 	}
 	if err := s.Save(want); err != nil {
@@ -40,9 +42,39 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("want %d servers, got %d", len(want), len(got))
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Errorf("server %d: got %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+// TestServersJSONHasNoPassword is the v6 rule at its bluntest: whatever the
+// in-memory entry carries, the file on disk must not hold a secret. Password is
+// json:"-", so there is no path from here to cleartext at all.
+func TestServersJSONHasNoPassword(t *testing.T) {
+	s := config.New(t.TempDir())
+
+	if err := s.Save([]model.Server{{
+		ID: "a", Host: "example.com", Port: 22, User: "root",
+		Auth: model.AuthPassword, Password: "hunter2",
+	}}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	raw, err := os.ReadFile(s.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "hunter2") || strings.Contains(string(raw), `"password":`) {
+		t.Fatalf("servers.json still carries a secret:\n%s", raw)
+	}
+
+	got, err := s.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Password != "" {
+		t.Errorf("Load returned a password from disk: %q", got[0].Password)
 	}
 }
 
@@ -152,6 +184,9 @@ func TestUpdateRoundTrip(t *testing.T) {
 
 	first.Port = 2222
 	first.Name = "alpha-edited"
+	// The password is not part of what round-trips any more: it lives in the
+	// vault, and servers.json has no field for it at all.
+	first.Password = ""
 	if err := s.Update(first); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
@@ -164,7 +199,7 @@ func TestUpdateRoundTrip(t *testing.T) {
 		t.Fatalf("want 2 servers, got %d", len(got))
 	}
 	// The edited entry keeps its slot; editing must not reorder the sidebar.
-	if got[0] != first {
+	if !reflect.DeepEqual(got[0], first) {
 		t.Errorf("updated entry: got %+v, want %+v", got[0], first)
 	}
 	if got[1].ID != second.ID {

@@ -4,6 +4,7 @@
 package ssh
 
 import (
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	xssh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/pyjhoop/ssh-client/internal/model"
 )
@@ -53,10 +55,12 @@ type Session struct {
 // opts. It is the single entry point to the network: Connect builds a shell on
 // top of it, and v2's SFTP support will reuse it as-is.
 func Dial(srv model.Server, opts Options) (*xssh.Client, error) {
-	auth, err := authMethods(srv)
+	auth, agentConn, err := authMethods(srv)
 	if err != nil {
 		return nil, err
 	}
+	defer agentConn.Close()
+
 	hostKey, err := opts.hostKeyCallback()
 	if err != nil {
 		return nil, err
@@ -327,7 +331,11 @@ func (s *Session) finish() {
 	close(s.out)
 }
 
-func authMethods(srv model.Server) ([]xssh.AuthMethod, error) {
+// authMethods builds the credentials for one dial. The io.Closer is the agent
+// socket when there is one and a no-op otherwise; Dial closes it once the
+// handshake is over, because an agent connection lives exactly as long as the
+// signing it is there to do.
+func authMethods(srv model.Server) ([]xssh.AuthMethod, io.Closer, error) {
 	switch srv.Auth {
 	case model.AuthPassword:
 		return []xssh.AuthMethod{
@@ -340,26 +348,93 @@ func authMethods(srv model.Server) ([]xssh.AuthMethod, error) {
 				}
 				return answers, nil
 			}),
-		}, nil
+		}, noopCloser{}, nil
 
 	case model.AuthKey:
-		pem, err := os.ReadFile(srv.KeyPath)
+		signer, err := keySigner(srv)
+		if err != nil {
+			return nil, noopCloser{}, err
+		}
+		return []xssh.AuthMethod{xssh.PublicKeys(signer)}, noopCloser{}, nil
+
+	case model.AuthAgent:
+		conn, signers, err := agentSigners()
+		if err != nil {
+			return nil, noopCloser{}, err
+		}
+		return []xssh.AuthMethod{xssh.PublicKeysCallback(signers)}, conn, nil
+
+	default:
+		return nil, noopCloser{}, fmt.Errorf("%w: unknown auth method %q", ErrKeyFile, srv.Auth)
+	}
+}
+
+type noopCloser struct{}
+
+func (noopCloser) Close() error { return nil }
+
+// keySigner turns the entry's key into a signer. A key body from the vault wins
+// over KeyPath: since v6 a key the user pasted lives encrypted, and reading a
+// stale keys/<id>.pem left over from before the migration would be worse than
+// failing.
+func keySigner(srv model.Server) (xssh.Signer, error) {
+	pem := srv.KeyPEM
+	source := "the stored key"
+	if len(pem) == 0 {
+		if srv.KeyPath == "" {
+			return nil, fmt.Errorf("%w: no key body and no key path", ErrKeyFile)
+		}
+		b, err := os.ReadFile(srv.KeyPath)
 		if err != nil {
 			return nil, fmt.Errorf("%w: read key %s: %w", ErrKeyFile, srv.KeyPath, err)
 		}
-		signer, err := xssh.ParsePrivateKey(pem)
-		if err != nil {
-			var passErr *xssh.PassphraseMissingError
-			if errors.As(err, &passErr) {
-				return nil, fmt.Errorf("%w: key %s is passphrase-protected (not supported yet)", ErrKeyFile, srv.KeyPath)
-			}
-			return nil, fmt.Errorf("%w: parse key %s: %w", ErrKeyFile, srv.KeyPath, err)
-		}
-		return []xssh.AuthMethod{xssh.PublicKeys(signer)}, nil
-
-	default:
-		return nil, fmt.Errorf("%w: unknown auth method %q", ErrKeyFile, srv.Auth)
+		pem, source = b, srv.KeyPath
 	}
+
+	signer, err := xssh.ParsePrivateKey(pem)
+	if err == nil {
+		return signer, nil
+	}
+
+	var passErr *xssh.PassphraseMissingError
+	if !errors.As(err, &passErr) {
+		return nil, fmt.Errorf("%w: parse key %s: %w", ErrKeyFile, source, err)
+	}
+	// Locked key. The passphrase comes from the vault; without one, say so with
+	// the sentinel that makes the UI ask for it rather than the generic key
+	// failure, which offers only "edit the entry".
+	if srv.KeyPassphrase == "" {
+		return nil, fmt.Errorf("%w: %s is passphrase-protected", ErrKeyPassphraseRequired, source)
+	}
+	signer, err = xssh.ParsePrivateKeyWithPassphrase(pem, []byte(srv.KeyPassphrase))
+	if err != nil {
+		// A wrong stored passphrase is the same situation as a missing one: ask
+		// again. x/crypto reports it as x509's incorrect-password error for both
+		// the OpenSSH and the legacy PEM formats.
+		if errors.Is(err, x509.IncorrectPasswordError) {
+			return nil, fmt.Errorf("%w: the stored passphrase does not open %s", ErrKeyPassphraseRequired, source)
+		}
+		return nil, fmt.Errorf("%w: parse key %s: %w", ErrKeyFile, source, err)
+	}
+	return signer, nil
+}
+
+// agentSigners connects to the agent named by SSH_AUTH_SOCK. There is no
+// fallback to another method on purpose: silently authenticating some other way
+// would leave the user unable to tell which credential was used.
+//
+// The connection is returned rather than closed here because the agent does the
+// signing: it has to stay open for the whole handshake.
+func agentSigners() (net.Conn, func() ([]xssh.Signer, error), error) {
+	sock := os.Getenv("SSH_AUTH_SOCK")
+	if sock == "" {
+		return nil, nil, fmt.Errorf("%w: SSH_AUTH_SOCK is not set", ErrAgentUnavailable)
+	}
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: connect to %s: %w", ErrAgentUnavailable, sock, err)
+	}
+	return conn, agent.NewClient(conn).Signers, nil
 }
 
 func termType() string {

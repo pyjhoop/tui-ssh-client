@@ -29,6 +29,14 @@ var (
 	// remote exit, because only this one may be reconnected automatically —
 	// retrying an "exit" would be an endless loop.
 	ErrConnectionLost = errors.New("connection lost")
+	// ErrAgentUnavailable means auth was set to "agent" and there is no agent to
+	// ask. We deliberately do not fall back to a password or a key file: the user
+	// would no longer know which credential opened the session.
+	ErrAgentUnavailable = errors.New("ssh-agent unavailable")
+	// ErrKeyPassphraseRequired is a private key we can read but not decrypt,
+	// because its passphrase is not in the vault yet. The UI answers it with a
+	// one-line prompt and stores the answer, so it is asked once per key.
+	ErrKeyPassphraseRequired = errors.New("key passphrase required")
 )
 
 // classify wraps a raw dial error with the sentinel that says what to do about
@@ -37,7 +45,7 @@ func classify(err error) error {
 	if err == nil {
 		return nil
 	}
-	for _, sentinel := range []error{ErrHostKeyMismatch, ErrHostKeyUnknown, ErrKeyFile, ErrAuth, ErrTimeout, ErrUnreachable, ErrConnectionLost} {
+	for _, sentinel := range []error{ErrHostKeyMismatch, ErrHostKeyUnknown, ErrAgentUnavailable, ErrKeyPassphraseRequired, ErrKeyFile, ErrAuth, ErrTimeout, ErrUnreachable, ErrConnectionLost} {
 		if errors.Is(err, sentinel) {
 			return err
 		}

@@ -63,6 +63,21 @@ func errorAdvice(err error, srv model.Server) (headline, hint string, actions []
 				"Reconnecting opens a new shell — whatever was running is gone.",
 			retry
 
+	case errors.Is(err, sshpkg.ErrAgentUnavailable):
+		return "ssh-agent unavailable",
+			"This entry authenticates through ssh-agent, and there is none:\n" +
+				firstLineOf(err) + "\n" +
+				"Start one and ssh-add the key, or change the entry to use a\n" +
+				"password or a key file. We deliberately do not fall back on our\n" +
+				"own — you would not know which credential had been used.",
+			retry
+
+	case errors.Is(err, sshpkg.ErrKeyPassphraseRequired):
+		return "key passphrase required",
+			"The private key is passphrase-protected and the vault does not\n" +
+				"have the passphrase yet. Retry to be asked for it.",
+			retry
+
 	case errors.Is(err, sshpkg.ErrKeyFile):
 		return "private key problem",
 			"The key could not be read or parsed:\n" + firstLineOf(err),

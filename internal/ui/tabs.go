@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
 
+	"github.com/pyjhoop/ssh-client/internal/config"
 	"github.com/pyjhoop/ssh-client/internal/model"
 	sshpkg "github.com/pyjhoop/ssh-client/internal/ssh"
 )
@@ -284,7 +285,9 @@ func (a *App) openTab(srv model.Server, force bool) tea.Cmd {
 	a.lastWasSFTP = false
 	a.rightMode = rightTerminal
 	a.focus = focusSidebar
-	return connect(a.store, a.hostKeys, srv, t.gen, cols, rows)
+	// The entry on disk knows the host; the vault knows how to get in. They are
+	// only ever put back together here, one dial at a time.
+	return connect(a.store, a.hostKeys, config.Inject(srv, a.secrets), t.gen, cols, rows)
 }
 
 // reconnect dials the tab's server again. Automatic attempts pass no prompt
@@ -313,7 +316,7 @@ func (a *App) reconnect(t *sessionTab, auto bool) tea.Cmd {
 		}
 	}
 	t.srv = srv
-	return connect(a.store, prompts, srv, t.gen, cols, rows)
+	return connect(a.store, prompts, config.Inject(srv, a.secrets), t.gen, cols, rows)
 }
 
 // scheduleReconnect puts the tab into its waiting state and arms the next
@@ -361,7 +364,8 @@ func (a *App) tabKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	// A dialog owns the keyboard while it is up — tab switching included. The
 	// import preview counts as one: it is a list you are choosing from, and
 	// switching the panel out from under it would strand the selection.
-	if a.confirm != nil || a.pending != nil || a.rename != nil || a.sftpErr != nil || a.importing != nil {
+	if a.confirm != nil || a.pending != nil || a.rename != nil || a.sftpErr != nil ||
+		a.importing != nil || a.syncForm != nil || a.keyPass != nil || a.unlock != nil {
 		return nil, false
 	}
 

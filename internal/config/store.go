@@ -261,8 +261,13 @@ func (s *Store) OwnsKey(path string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// SaveKey writes a pasted private key body to keys/<id>.pem with 0600
-// permissions and returns the path.
+// SaveKey writes a private key body to keys/<id>.pem with 0600 permissions and
+// returns the path.
+//
+// Since v6 the UI no longer calls this: a pasted key goes into the vault, and
+// keys/ only holds files written by an older version, which ScanPlaintext moves
+// out and deletes. It stays because that migration has to be testable, and
+// because Remove still has to know what it owns.
 func (s *Store) SaveKey(id, body string) (string, error) {
 	if strings.TrimSpace(body) == "" {
 		return "", errors.New("empty key body")
@@ -289,8 +294,10 @@ func (s *Store) SaveKey(id, body string) (string, error) {
 	return path, nil
 }
 
-// PlaintextWarningSeen reports whether the "passwords are stored in plaintext"
-// warning has already been shown once.
+// PlaintextWarningSeen reports whether the pre-v6 "passwords are stored in
+// plaintext" warning has already been shown once. Nothing shows it any more —
+// the statement stopped being true — but Migrate removes the marker, and this
+// is how a test checks that it did.
 func (s *Store) PlaintextWarningSeen() bool {
 	_, err := os.Stat(filepath.Join(s.dir, warnFile))
 	return err == nil

@@ -1,12 +1,21 @@
 # ── 절대 커밋하면 안 되는 것: 이 앱이 다루는 자격증명 ──────────────────────
 # 정상 위치는 ${XDG_CONFIG_HOME:-~/.config}/ssh-client/ 이라 레포 안에 생길 일이
 # 없지만, 테스트나 XDG_CONFIG_HOME=. 같은 실행 한 번이면 여기에 떨어진다.
-# servers.json 은 비밀번호를 평문으로 담는다(v0 결정) — 사고를 되돌릴 수 없다.
+# v6부터 비밀은 vault.age 안에만 있지만, 그 파일도 커밋 대상이 아니다 —
+# 오프라인 브루트포스의 재료를 레포에 올릴 이유가 없다. servers.json 은 이제
+# 메타데이터뿐이지만 호스트 이름도 정보다.
+# servers.json.plaintext.bak 은 마이그레이션 직전의 평문 원본이다 — 가장 위험하다.
 servers.json
 servers.json.tmp
+servers.json.plaintext.bak
+vault.age
+vault.age.tmp
+ssh-client.age
+ssh-client.local.bak
 ui.json
 ui.json.tmp
 known_hosts
+known_hosts.tmp
 .plaintext-warning-ack
 keys/
 

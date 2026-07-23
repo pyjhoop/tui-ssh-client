@@ -19,6 +19,7 @@ import (
 	"github.com/pyjhoop/ssh-client/internal/model"
 	sftppkg "github.com/pyjhoop/ssh-client/internal/sftp"
 	sshpkg "github.com/pyjhoop/ssh-client/internal/ssh"
+	"github.com/pyjhoop/ssh-client/internal/vault"
 )
 
 type focusArea int
@@ -30,6 +31,7 @@ const (
 	focusLocal
 	focusRemote
 	focusImport
+	focusSync
 )
 
 type rightMode int
@@ -41,6 +43,7 @@ const (
 	rightError
 	rightSFTP
 	rightImport
+	rightSync
 )
 
 // escapeHint is the key that moves focus out of a live session.
@@ -79,6 +82,27 @@ type App struct {
 	// confirm, when set, replaces the right panel body and swallows every key
 	// that is not an answer to it.
 	confirm *confirm
+
+	// Vault state. secrets is the decrypted contents and pass is the passphrase
+	// that opened it — both live for the process only. The passphrase is never
+	// written anywhere: a "remember on this device" option would turn the vault
+	// into a padlock drawn on a plaintext file.
+	//
+	// unlock is the startup gate. While it is non-nil nothing else is drawn and
+	// nothing else sees a key: it is the modal rule at its strictest.
+	secrets vault.Secrets
+	pass    string
+	unlock  *unlockState
+
+	// syncForm is the opt-in GitHub registration, non-nil only in rightSync.
+	// Before it has ever been filled in there is no token, no repository and no
+	// request — the sync package is not reached at all.
+	syncForm *syncForm
+
+	// keyPass asks for a passphrase that unlocks a private key. It is a separate
+	// question from the vault's, and the answer goes into the vault so it is
+	// asked once per key.
+	keyPass *keyPassState
 
 	// importing is the ~/.ssh/config preview, non-nil only in rightImport mode.
 	// prevRight is the mode to fall back to when it is cancelled, so leaving the
@@ -138,20 +162,41 @@ func New(store *config.Store) *App {
 }
 
 func (a *App) Init() tea.Cmd {
-	return tea.Batch(loadServers(a.store), loadUIState(a.store), waitForHostKey(a.hostKeys))
+	return tea.Batch(
+		loadServers(a.store),
+		loadUIState(a.store),
+		scanStartup(a.store),
+		waitForHostKey(a.hostKeys),
+	)
+}
+
+// Unlocked pre-opens the vault, for the --pull bootstrap that has already had
+// to ask for the passphrase before there was a UI to ask from.
+func (a *App) Unlocked(pass string, sec vault.Secrets) {
+	a.pass, a.secrets = pass, sec
 }
 
 // ── messages ────────────────────────────────────────────────────────────────
 
 type serversLoadedMsg struct {
 	servers []model.Server
+	// removed is the entry a delete took out, so its secrets can be dropped
+	// from the vault too. Leaving them behind would keep a password for a
+	// server that no longer exists.
+	removed string
 	err     error
 }
 
+// serverSavedMsg reports a written server list. The secrets ride along rather
+// than being written by the same command: the vault lives in App, and a command
+// running off the UI goroutine may not touch it.
 type serverSavedMsg struct {
-	servers []model.Server
-	warn    string
-	err     error
+	servers  []model.Server
+	saved    model.Server
+	password string
+	keyBody  string
+	editing  bool
+	err      error
 }
 
 // uiStateLoadedMsg carries the fold and sort preferences. It has no error field
@@ -332,49 +377,45 @@ func importServers(store *config.Store, chosen []model.Server, skipped int) tea.
 	}
 }
 
-// saveServer persists the entry, writing a pasted key body to keys/<id>.pem
-// first so only the path ends up in servers.json.
+// saveServer persists the entry. Since v6 nothing secret goes to disk here: the
+// password and any pasted key body come back on the message and are put into
+// the vault by Update, which is the only place allowed to touch it.
 func saveServer(store *config.Store, srv model.Server, keyBody string) tea.Cmd {
+	password := srv.Password
+	// A pasted key satisfies Validate without ever reaching the disk: KeyPEM is
+	// json:"-", so this is only ever an in-memory claim that a key exists.
+	if keyBody != "" {
+		srv.KeyPEM = []byte(keyBody)
+	}
 	return func() tea.Msg {
-		if keyBody != "" {
-			path, err := store.SaveKey(srv.ID, keyBody)
-			if err != nil {
-				return serverSavedMsg{err: err}
-			}
-			srv.KeyPath = path
-		}
 		if err := srv.Validate(); err != nil {
 			return serverSavedMsg{err: err}
 		}
-
-		var warn string
-		if srv.Auth == model.AuthPassword && !store.PlaintextWarningSeen() {
-			warn = "⚠ passwords are stored in plaintext in " + store.Path()
-			if err := store.MarkPlaintextWarningSeen(); err != nil {
-				return serverSavedMsg{err: err}
-			}
-		}
-
-		if _, err := store.Add(srv); err != nil {
+		saved, err := store.Add(srv)
+		if err != nil {
 			return serverSavedMsg{err: err}
 		}
 		servers, err := store.Load()
-		return serverSavedMsg{servers: servers, warn: warn, err: err}
+		return serverSavedMsg{
+			servers:  servers,
+			saved:    saved,
+			password: password,
+			keyBody:  keyBody,
+			err:      err,
+		}
 	}
 }
 
 // updateServer is saveServer's counterpart for an existing entry. A blank key
-// body keeps whatever KeyPath the entry already had; a pasted one overwrites
-// keys/<id>.pem, which is the same file because the ID does not change.
+// body keeps whatever key the entry already had, in the vault or at KeyPath.
 func updateServer(store *config.Store, srv model.Server, keyBody string) tea.Cmd {
+	password := srv.Password
+	// A pasted key satisfies Validate without ever reaching the disk: KeyPEM is
+	// json:"-", so this is only ever an in-memory claim that a key exists.
+	if keyBody != "" {
+		srv.KeyPEM = []byte(keyBody)
+	}
 	return func() tea.Msg {
-		if keyBody != "" {
-			path, err := store.SaveKey(srv.ID, keyBody)
-			if err != nil {
-				return serverSavedMsg{err: err}
-			}
-			srv.KeyPath = path
-		}
 		if err := srv.Validate(); err != nil {
 			return serverSavedMsg{err: err}
 		}
@@ -382,7 +423,14 @@ func updateServer(store *config.Store, srv model.Server, keyBody string) tea.Cmd
 			return serverSavedMsg{err: err}
 		}
 		servers, err := store.Load()
-		return serverSavedMsg{servers: servers, err: err}
+		return serverSavedMsg{
+			servers:  servers,
+			saved:    srv,
+			password: password,
+			keyBody:  keyBody,
+			editing:  true,
+			err:      err,
+		}
 	}
 }
 
@@ -392,7 +440,7 @@ func removeServer(store *config.Store, id string) tea.Cmd {
 			return serversLoadedMsg{err: err}
 		}
 		servers, err := store.Load()
-		return serversLoadedMsg{servers: servers, err: err}
+		return serversLoadedMsg{servers: servers, removed: id, err: err}
 	}
 }
 
@@ -613,6 +661,34 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		a.servers = msg.servers
 		a.sidebar.SetServers(a.servers)
+		// A deleted server's secrets go with it. Only re-seal when there was
+		// actually something to forget.
+		if msg.removed != "" && a.pass != "" && a.hasSecretsFor(msg.removed) {
+			a.secrets.Forget(msg.removed)
+			return a, a.persistSecrets("")
+		}
+		return a, nil
+
+	case startupScanMsg:
+		if msg.err != nil {
+			a.errMsg = msg.err.Error()
+			return a, nil
+		}
+		return a, a.gateStartup(msg)
+
+	case unlockedMsg:
+		cmd := a.applyUnlocked(msg)
+		// The list on disk may have been rewritten by the migration.
+		return a, tea.Batch(cmd, loadServers(a.store))
+
+	case secretsSavedMsg:
+		if msg.err != nil {
+			a.errMsg = "vault: " + firstLineOf(msg.err)
+			return a, nil
+		}
+		if msg.status != "" {
+			a.status = msg.status
+		}
 		return a, nil
 
 	case uiStateLoadedMsg:
@@ -657,14 +733,36 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		a.servers = msg.servers
 		a.sidebar.SetServers(a.servers)
-		a.warning = msg.warn
 		a.status = "saved"
-		if a.form.editingID != "" {
+		if msg.editing {
 			a.status = "updated"
 		}
 		a.rightMode = rightEmpty
 		a.focus = focusSidebar
-		return a, nil
+
+		// The secrets are put in the vault here rather than in the command,
+		// because the vault belongs to the model and a command runs elsewhere.
+		var cmd tea.Cmd
+		if id := msg.saved.ID; id != "" {
+			changed := false
+			if msg.saved.Auth == model.AuthPassword {
+				a.secrets.SetPassword(id, msg.password)
+				changed = true
+			}
+			if msg.keyBody != "" {
+				a.secrets.SetKey(id, msg.keyBody)
+				changed = true
+			}
+			if msg.saved.Auth == model.AuthAgent {
+				// Switching to the agent means we hold nothing for this server.
+				a.secrets.Forget(id)
+				changed = true
+			}
+			if changed && a.pass != "" {
+				cmd = a.persistSecrets(a.status)
+			}
+		}
+		return a, cmd
 
 	case connectedMsg:
 		t, ok := a.tabByGen(msg.gen)
@@ -720,7 +818,14 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, a.scheduleReconnect(t, msg.err)
 		}
 		// A first connect that never came up leaves nothing worth keeping.
+		srv := t.srv
 		a.closeTab(a.tabIndexOf(t))
+		// A locked key is a question, not a failure: the answer is one line of
+		// input, so asking beats an error card offering "edit connection".
+		if errors.Is(msg.err, sshpkg.ErrKeyPassphraseRequired) {
+			a.askKeyPassphrase(srv, false)
+			return a, nil
+		}
 		a.rightMode = rightError
 		a.focus = focusSidebar
 		a.failErr = msg.err
@@ -792,6 +897,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// still worth looking at, and retrying should not cost the layout.
 		a.connectingSFTP = ""
 		a.confirm = nil
+		if errors.Is(msg.err, sshpkg.ErrKeyPassphraseRequired) {
+			a.askKeyPassphrase(a.lastAttempt, true)
+			return a, nil
+		}
 		a.sftpErr = msg.err
 		a.failErr = msg.err
 		a.focus = focusLocal
@@ -892,7 +1001,73 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.status = msg.status
 		return a, a.refreshPanes()
 
+	case syncCheckedMsg:
+		if a.syncForm != nil {
+			a.syncForm.busy = false
+		}
+		if msg.err != nil {
+			if a.syncForm != nil {
+				a.syncForm.err = syncAdvice(msg.err)
+			}
+			return a, nil
+		}
+		// Only now, with the repository proven private, is the token stored.
+		auth := msg.auth
+		if old := a.secrets.GitHub; old != nil && old.Owner == auth.Owner && old.Repo == auth.Repo && old.Path == auth.Path {
+			auth.SHA = old.SHA // same file: keep the optimistic lock
+		}
+		a.secrets.GitHub = &auth
+		a.closeSync()
+		return a, a.persistSecrets("sync registered · " + auth.Owner + "/" + auth.Repo + " · S push, P pull")
+
+	case syncPushedMsg:
+		if msg.err != nil {
+			a.status = ""
+			a.errMsg = syncAdvice(msg.err)
+			return a, nil
+		}
+		a.errMsg = ""
+		if a.secrets.GitHub != nil {
+			a.secrets.GitHub.SHA = msg.sha
+		}
+		status := fmt.Sprintf("synced · %s · %s", plural(msg.servers, "server"), time.Now().Format("2006-01-02 15:04"))
+		return a, a.persistSecrets(status)
+
+	case syncFetchedMsg:
+		a.status = ""
+		if msg.err != nil {
+			a.errMsg = syncAdvice(msg.err)
+			return a, nil
+		}
+		a.errMsg = ""
+		a.confirm = a.pullConfirm(msg)
+		a.focus = focusSidebar
+		return a, nil
+
+	case syncAppliedMsg:
+		if msg.err != nil {
+			a.status = ""
+			a.errMsg = syncAdvice(msg.err)
+			return a, nil
+		}
+		a.secrets = msg.secrets
+		a.errMsg = ""
+		a.status = pullStatus(msg.report)
+		if len(msg.report.Conflicts) > 0 {
+			// Host keys that disagreed are not a footnote: that is what a
+			// machine-in-the-middle looks like, so it gets the warning line.
+			a.warning = "⚠ kept the local host key for " + strings.Join(msg.report.Conflicts, ", ")
+		}
+		// Open tabs are deliberately untouched: their connections are already
+		// made, and a list that changed under them says nothing about that.
+		return a, loadServers(a.store)
+
 	case tea.MouseMsg:
+		// The gate takes the mouse too, or a click could reach a list that is
+		// not even drawn.
+		if a.unlock != nil {
+			return a, nil
+		}
 		return a, a.handleMouse(msg)
 
 	case tea.KeyMsg:
@@ -943,6 +1118,18 @@ func (a *App) deleteConfirm(msg deletePlannedMsg) *confirm {
 }
 
 func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
+	// The vault gate is the strictest form of the modal rule: while it is up
+	// nothing else is drawn and nothing else may see a key — not q, not alt+2,
+	// not ctrl+b. There is no state behind it to reach.
+	if a.unlock != nil {
+		return a.handleUnlockKey(msg)
+	}
+
+	// A key passphrase question is the same kind of thing, one layer down.
+	if a.keyPass != nil {
+		return a.handleKeyPassKey(msg)
+	}
+
 	// ctrl+c means "stop the transfer", not "quit", while one is running. The
 	// session branch below still gets it when the shell is focused: a remote
 	// program needs its own interrupt.
@@ -967,9 +1154,14 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return cmd
 	}
 
-	// The import preview is modal for the same reason.
+	// The import preview is modal for the same reason. So is the sync form: it
+	// is a set of fields being filled in, and switching the panel out from under
+	// it would strand them.
 	if a.focus == focusImport {
 		return a.handleImportKey(msg)
+	}
+	if a.focus == focusSync {
+		return a.handleSyncKey(msg)
 	}
 
 	// The rename input owns the keyboard the same way a confirmation does, and
@@ -1043,10 +1235,7 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 				return nil
 			}
 			a.form.err = ""
-			if a.form.editingID != "" {
-				return updateServer(a.store, srv, keyBody)
-			}
-			return saveServer(a.store, srv, keyBody)
+			return a.submitForm(srv, keyBody)
 		}
 		return cmd
 
@@ -1089,6 +1278,12 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 			}
 		case "i":
 			return a.openImport()
+		case "Y":
+			return a.openSync()
+		case "S":
+			return a.startPush()
+		case "P":
+			return a.startPull()
 		case "s":
 			a.sidebar.SetSortRecent(!a.sidebar.SortRecent())
 			if a.sidebar.SortRecent() {
@@ -1130,6 +1325,30 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		}
 		return a.sidebar.Update(msg)
 	}
+}
+
+// submitForm saves the entry, creating the vault first if this is the first
+// secret the user has ever stored.
+//
+// The vault is made here and nowhere earlier: that is the whole of the "no
+// secrets, no prompt" rule. Somebody who only ever uses ssh-agent goes through
+// this function every time and is never asked for a passphrase.
+func (a *App) submitForm(srv model.Server, keyBody string) tea.Cmd {
+	save := func(app *App) tea.Cmd {
+		if app.form.editingID != "" {
+			return updateServer(app.store, srv, keyBody)
+		}
+		return saveServer(app.store, srv, keyBody)
+	}
+
+	hasSecret := (srv.Auth == model.AuthPassword && srv.Password != "") || keyBody != ""
+	if hasSecret {
+		if cmd, waiting := a.requireVault(
+			"This password will be encrypted.\nChoose a passphrase for the vault — it is never stored.", save); waiting {
+			return cmd
+		}
+	}
+	return save(a)
 }
 
 // activateSelection opens the form or connects, depending on the highlighted
@@ -1315,7 +1534,9 @@ func (a *App) editServer(srv model.Server) tea.Cmd {
 		return nil
 	}
 	w, h := a.rightInner()
-	a.form = newFormFor(srv, w, h)
+	// The entry on disk has no password: fill it in from the vault, or the edit
+	// would save it back empty.
+	a.form = newFormFor(config.Inject(srv, a.secrets), w, h)
 	a.form.setGroups(a.sidebar.Groups())
 	a.rightMode = rightForm
 	a.focus = focusForm
@@ -1637,6 +1858,11 @@ func (a *App) View() string {
 	if a.width == 0 || a.height == 0 {
 		return "starting…"
 	}
+	// Nothing is drawn behind the gate — not even the server names, which are
+	// exactly what the vault exists to keep unreadable.
+	if a.unlock != nil {
+		return a.unlockView()
+	}
 
 	cols, rows := a.rightInner()
 
@@ -1657,7 +1883,7 @@ func (a *App) View() string {
 		// The right panel gets a title bar of its own, mirroring the sidebar's
 		// "Servers" heading, so a live session always announces which host it is.
 		rightContent := a.rightHeader(cols) + "\n" + clampBlock(a.rightBody(cols, rows), cols, rows)
-		right = panelStyle(a.focus == focusSession || a.focus == focusForm || a.focus == focusImport).
+		right = panelStyle(a.focus == focusSession || a.focus == focusForm || a.focus == focusImport || a.focus == focusSync).
 			Render(clampBlock(rightContent, cols, a.panelHeight()))
 	}
 
@@ -1792,6 +2018,9 @@ func (a *App) rightHeader(cols int) string {
 		if a.importing != nil && len(a.importing.rows) == 0 {
 			detail = "reading…"
 		}
+	case rightSync:
+		title = "Sync"
+		detail = "private GitHub repo"
 	}
 
 	line := strings.Repeat(" ", padX) + styleTitleBar.Render(title)
@@ -1802,6 +2031,11 @@ func (a *App) rightHeader(cols int) string {
 }
 
 func (a *App) rightBody(cols, rows int) string {
+	// A key passphrase question is the newest thing on screen, so it owns the
+	// body the way a confirmation does.
+	if a.keyPass != nil {
+		return inset(a.keyPassView())
+	}
 	// A confirmation replaces the body outright — see confirm.go for why it is
 	// not drawn as an overlay.
 	if a.confirm != nil {
@@ -1836,6 +2070,12 @@ func (a *App) rightBody(cols, rows int) string {
 			return inset("reading " + a.importing.path + "…")
 		}
 		return inset(a.importing.View(cols-2*padX, rows))
+
+	case rightSync:
+		if a.syncForm == nil {
+			return inset("sync")
+		}
+		return inset(a.syncForm.View())
 
 	default:
 		var b strings.Builder
@@ -1880,6 +2120,8 @@ func (a *App) statusLine() string {
 		return styleStatus.Render("type to filter · enter keep results · esc clear")
 	case a.rightMode == rightImport:
 		return styleStatus.Render("space select · a all/none · enter import · esc cancel")
+	case a.rightMode == rightSync:
+		return styleStatus.Render("tab move · enter check and save · esc cancel")
 	case a.rightMode == rightSFTP:
 		return styleStatus.Render("tab pane · space select · t send · d delete · R rename · r refresh · drag to transfer · " + escapeHint + " back")
 	case len(a.tabs) > 1:

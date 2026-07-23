@@ -371,6 +371,36 @@ sidebar ──(P)──▶ pulling ──▶ confirm(교체 미리보기) ──
 9. 동기화를 등록하지 않은 상태로 앱을 켜고 종료 → 네트워크 트래픽이 GitHub로 나가지 않는다
    (`ss`/방화벽 로그로 확인).
 
+---
+
+## 구현 후 메모 (계획과 달라진 것)
+
+전체 설계는 위 그대로 구현됐다. 실제로 코드를 쓰면서 달라진 것만 적는다.
+
+- **`vault.Secrets`에 편의 메서드가 붙었다** — `SetPassword`/`SetKey`/`SetKeyPass`/`Forget`/
+  `Empty`. 빈 값을 넣으면 키를 지우므로, "비밀번호를 지웠다"가 "빈 문자열을 저장했다"가 되지
+  않는다. `Empty()`는 "금고를 만들 이유가 있는가"를 묻는 곳이다.
+- **`sync.Remote`에 `Base` 필드가 생겼다.** `httptest.Server`를 가리키기 위한 것이고,
+  프로덕션에서는 비어 있다(`APIBase`). ui 쪽에도 같은 목적의 `syncBase` 변수가 하나 있다 —
+  네트워크 없이 push/pull 전체를 도는 유일한 방법이다.
+- **422도 `ErrSyncConflict`다.** Contents API는 낡은 sha에 409가 아니라 422를 돌려주는 경우가
+  있고, 둘 다 "원격이 우리보다 앞서 있다"는 같은 상황이다.
+- **`ErrHTTP` 센티널을 추가했다.** 상태코드로 분류되지 않는 나머지(파싱 실패, 도달 불가)를
+  담는다 — 이것도 문자열 매칭 없이 갈라지기 위해서다.
+- **`--path` 플래그를 추가했다.** 레포 안 경로가 기본값과 다른 첫 pull에 필요하다.
+- **인증 토글은 3단이라 `←`/`→`가 방향을 갖는다**(`toggleAuth(delta)`). agent를 고르면
+  Secret·Key body 칸이 아예 사라진다 — 보관할 것이 없다는 사실이 화면에 그대로 보여야 한다.
+- **agent 소켓의 수명이 명시적이 됐다.** `authMethods`가 `io.Closer`를 같이 돌려주고 `Dial`이
+  defer로 닫는다. 서명은 agent가 하므로 핸드셰이크가 끝나기 전에 닫으면 안 되고, 닫지 않으면
+  재연결마다 fd가 샌다.
+- **`ApplyBundle`이 백업을 스스로 남긴다**(`ssh-client.local.bak`). 계획에서는 UI의 일이었지만,
+  "교체 직전"을 아는 곳이 여기뿐이라 원자성이 지켜진다.
+- **`config.Inject`가 금고→서버 주입의 유일한 지점이다.** `openTab`/`reconnect`/`startSFTP`/
+  `editServer` 넷이 이걸 부른다. 폼 편집도 포함인 이유는, `Update`가 엔트리를 통째로 교체하므로
+  주입하지 않으면 편집 한 번에 비밀번호가 지워지기 때문이다.
+- **scrypt work factor는 19다.** 연산당 수백 ms이고 `-race`에서는 수 초라, ui 테스트가
+  커맨드를 goroutine에서 돌리는 헬퍼(`drain`/`run`)를 갖게 됐다.
+
 ## v6에서 하지 않는 것 (의도적 제외)
 - OS 키체인·하드웨어 키(FIDO2/PIV) — 동기화와 충돌하고 WSL2에서 테스트 불가
 - agent forwarding, 점프호스트/ProxyJump → **v7**

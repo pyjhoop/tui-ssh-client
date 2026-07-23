@@ -17,6 +17,9 @@ type AuthMethod string
 const (
 	AuthPassword AuthMethod = "password"
 	AuthKey      AuthMethod = "key"
+	// AuthAgent delegates to a running ssh-agent. It is the only method that
+	// stores nothing at all: the safest secret is the one we never hold.
+	AuthAgent AuthMethod = "agent"
 )
 
 // DefaultPort is used when the form leaves the port field empty.
@@ -24,14 +27,27 @@ const DefaultPort = 22
 
 // Server is a saved connection entry.
 type Server struct {
-	ID       string     `json:"id"`
-	Name     string     `json:"name,omitempty"`
-	Host     string     `json:"host"`
-	Port     int        `json:"port"`
-	User     string     `json:"user"`
-	Auth     AuthMethod `json:"auth"`
-	Password string     `json:"password,omitempty"` // v0: stored in plaintext
-	KeyPath  string     `json:"key_path,omitempty"`
+	ID   string     `json:"id"`
+	Name string     `json:"name,omitempty"`
+	Host string     `json:"host"`
+	Port int        `json:"port"`
+	User string     `json:"user"`
+	Auth AuthMethod `json:"auth"`
+
+	// Password and KeyPEM are never serialised: since v6 they live in the
+	// encrypted vault and are filled in from it just before dialling. The fields
+	// stay so the path into ssh.Connect is unchanged — what moved is where the
+	// value comes from, not who consumes it.
+	Password string `json:"-"`
+	KeyPEM   []byte `json:"-"`
+	// KeyPassphrase unlocks a passphrase-protected key. It is asked for once and
+	// then kept in the vault, so it is filled in from there like the rest.
+	KeyPassphrase string `json:"-"`
+
+	// KeyPath still points at a key the *user* owns (~/.ssh/id_ed25519). A key
+	// they pasted into the form is ours, and goes in the vault instead: copying
+	// theirs would silently keep using an old key after they replaced it.
+	KeyPath string `json:"key_path,omitempty"`
 
 	// Group is the one-level folder this server sits in; empty means ungrouped.
 	// There is no group table — a group is just "the servers carrying this
@@ -101,9 +117,12 @@ func (s Server) Validate() error {
 			return errors.New("password is required")
 		}
 	case AuthKey:
-		if strings.TrimSpace(s.KeyPath) == "" {
+		if strings.TrimSpace(s.KeyPath) == "" && len(s.KeyPEM) == 0 {
 			return errors.New("key path (or pasted key body) is required")
 		}
+	case AuthAgent:
+		// Nothing to check: the agent holds the credential, and whether it has
+		// a usable one is only knowable at dial time.
 	default:
 		return fmt.Errorf("unknown auth method %q", s.Auth)
 	}

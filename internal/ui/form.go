@@ -116,6 +116,9 @@ func newFormFor(srv model.Server, width, height int) form {
 	}
 	f.inputs[fieldPort].SetValue(strconv.Itoa(port))
 	f.inputs[fieldUser].SetValue(srv.User)
+	// The password comes from the vault, injected by the caller. Without it an
+	// edit would blank the field and Update would replace the entry with one
+	// that has no password at all.
 	if f.auth == model.AuthPassword {
 		f.inputs[fieldSecret].SetValue(srv.Password)
 	} else {
@@ -131,7 +134,7 @@ func newFormFor(srv model.Server, width, height int) form {
 func (f *form) applyAuth() {
 	secret := &f.inputs[fieldSecret]
 	if f.auth == model.AuthPassword {
-		secret.Placeholder = "password"
+		secret.Placeholder = "password · stored encrypted in vault.age"
 		secret.EchoMode = textinput.EchoPassword
 		secret.EchoCharacter = '•'
 	} else {
@@ -150,10 +153,15 @@ func (f *form) setSize(width, height int) {
 }
 
 // visible reports whether a field is shown for the current auth method.
+//
+// ssh-agent has no secret of its own: the agent holds the key and we hold
+// nothing, so both the secret field and the key pad go away.
 func (f *form) visible(idx int) bool {
 	switch idx {
 	case fieldKeyBody:
 		return f.auth == model.AuthKey
+	case fieldSecret:
+		return f.auth != model.AuthAgent
 	default:
 		return true
 	}
@@ -213,9 +221,14 @@ func (f *form) Update(msg tea.Msg) (tea.Cmd, formAction) {
 			if f.focused != fieldKeyBody {
 				return nil, formSubmit
 			}
-		case tea.KeyLeft, tea.KeyRight, tea.KeySpace:
+		case tea.KeyLeft:
 			if f.focused == fieldAuth {
-				f.toggleAuth()
+				f.toggleAuth(-1)
+				return nil, formNone
+			}
+		case tea.KeyRight, tea.KeySpace:
+			if f.focused == fieldAuth {
+				f.toggleAuth(1)
 				return nil, formNone
 			}
 		}
@@ -238,14 +251,25 @@ func (f *form) Update(msg tea.Msg) (tea.Cmd, formAction) {
 	return cmd, formNone
 }
 
-func (f *form) toggleAuth() {
-	if f.auth == model.AuthPassword {
-		f.auth = model.AuthKey
-	} else {
-		f.auth = model.AuthPassword
+// authOrder is the toggle's cycle. Agent is last because it is the one that
+// stores nothing — the option to reach for once the other two feel like work.
+var authOrder = []model.AuthMethod{model.AuthPassword, model.AuthKey, model.AuthAgent}
+
+func (f *form) toggleAuth(delta int) {
+	idx := 0
+	for i, m := range authOrder {
+		if m == f.auth {
+			idx = i
+			break
+		}
 	}
+	f.auth = authOrder[(idx+delta+len(authOrder))%len(authOrder)]
 	f.inputs[fieldSecret].SetValue("")
 	f.applyAuth()
+	// The secret field disappears for agent auth; do not leave focus on it.
+	if !f.visible(f.focused) {
+		f.move(1)
+	}
 }
 
 // fieldBlock is the row range a field occupies, label and input included.
@@ -360,11 +384,14 @@ func (f *form) authToggleView() string {
 		opt("Password", f.auth == model.AuthPassword),
 		" ",
 		opt("Key", f.auth == model.AuthKey),
+		" ",
+		opt("Agent", f.auth == model.AuthAgent),
 	)
 }
 
 // Server builds a Server from the current field values. The pasted key body is
-// returned separately because writing it to disk belongs to the config package.
+// returned separately because it is a secret: since v6 it goes into the vault,
+// not into keys/<id>.pem, and only the root model may put it there.
 func (f *form) Server() (model.Server, string, error) {
 	port := model.DefaultPort
 	if raw := strings.TrimSpace(f.inputs[fieldPort].Value()); raw != "" {
@@ -387,9 +414,12 @@ func (f *form) Server() (model.Server, string, error) {
 	}
 
 	keyBody := ""
-	if f.auth == model.AuthPassword {
+	switch {
+	case f.auth == model.AuthAgent:
+		// Nothing to collect: the agent holds the credential.
+	case f.auth == model.AuthPassword:
 		srv.Password = f.inputs[fieldSecret].Value()
-	} else {
+	default:
 		srv.KeyPath = strings.TrimSpace(f.inputs[fieldSecret].Value())
 		keyBody = strings.TrimSpace(f.keyPad.Value())
 		if srv.KeyPath == "" && keyBody == "" {

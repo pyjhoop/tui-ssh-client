@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/pyjhoop/ssh-client/internal/config"
 	"github.com/pyjhoop/ssh-client/internal/model"
 	sftppkg "github.com/pyjhoop/ssh-client/internal/sftp"
 )
@@ -415,7 +416,7 @@ func (a *App) startSFTP(srv model.Server) tea.Cmd {
 	}
 	return tea.Batch(
 		listDir(a.local.br, focusLocal, home, gen),
-		connectSFTP(a.store, a.hostKeys, srv, gen),
+		connectSFTP(a.store, a.hostKeys, config.Inject(srv, a.secrets), gen),
 	)
 }
 

@@ -235,6 +235,9 @@ type testServer struct {
 	// TCP connection up — what a dropped link looks like from the client side,
 	// and the only thing the keepalive can tell apart from a healthy idle one.
 	silent atomic.Bool
+	// sawKey is the marshalled public key the last handshake offered, so a test
+	// can tell *which* key authenticated.
+	sawKey atomic.Value
 }
 
 // addr is what the host key callback sees and what known_hosts lines key on.
@@ -264,11 +267,22 @@ func startTestServer(t *testing.T) *testServer {
 		t.Fatalf("host key signer: %v", err)
 	}
 
+	srv := &testServer{
+		hostKey: signer.PublicKey(),
+		resized: make(chan [2]int, 4),
+	}
+
 	cfg := &xssh.ServerConfig{
 		PasswordCallback: func(_ xssh.ConnMetadata, password []byte) (*xssh.Permissions, error) {
 			if string(password) != "secret" {
 				return nil, errors.New("bad password")
 			}
+			return nil, nil
+		},
+		// Any key is accepted: these tests are about which credential our side
+		// picks and where it came from, not about server-side authorisation.
+		PublicKeyCallback: func(_ xssh.ConnMetadata, key xssh.PublicKey) (*xssh.Permissions, error) {
+			srv.sawKey.Store(string(key.Marshal()))
 			return nil, nil
 		},
 	}
@@ -288,12 +302,7 @@ func startTestServer(t *testing.T) *testServer {
 		t.Fatalf("parse port: %v", err)
 	}
 
-	srv := &testServer{
-		host:    host,
-		port:    port,
-		hostKey: signer.PublicKey(),
-		resized: make(chan [2]int, 4),
-	}
+	srv.host, srv.port = host, port
 
 	// Cleanups run last-in-first-out: close the listener first, then wait for
 	// the accept loop and its connection handlers to drain.

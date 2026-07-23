@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -57,21 +58,30 @@ func TestSmoke(t *testing.T) {
 		t.Errorf("no key was pasted, got body %q", keyBody)
 	}
 	want := model.Server{Host: "example.com", Port: 2222, User: "deploy", Auth: model.AuthPassword, Password: "hunter2", Group: "prod"}
-	if srv != want {
+	if !reflect.DeepEqual(srv, want) {
 		t.Fatalf("form.Server: got %+v, want %+v", srv, want)
 	}
 
-	// Save it and let the resulting command run.
-	cmd := app.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
-	if cmd == nil {
-		t.Fatal("save produced no command")
+	// Saving the first password is what creates the vault: there was nothing
+	// secret to protect until this moment, which is why no passphrase was asked
+	// for at startup.
+	app.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if app.unlock == nil {
+		t.Fatal("saving the first password should ask for a vault passphrase")
 	}
-	m, _ = m.Update(cmd())
+	if len(app.servers) != 0 {
+		t.Fatal("nothing may be saved before the vault exists")
+	}
+	m = unlockWith(t, m, app, "a good passphrase")
+
 	if len(app.servers) != 1 {
 		t.Fatalf("want 1 saved server, got %d", len(app.servers))
 	}
-	if !strings.Contains(app.warning, "plaintext") {
-		t.Errorf("expected the plaintext warning, got %q", app.warning)
+	if !app.store.HasVault() {
+		t.Error("the vault file was not created")
+	}
+	if app.secrets.Password(app.servers[0].ID) != "hunter2" {
+		t.Errorf("the password did not reach the vault: %+v", app.secrets)
 	}
 
 	// The saved server shows up in the sidebar, and the view still renders.
@@ -492,7 +502,7 @@ func TestEditFormPrefills(t *testing.T) {
 	if keyBody != "" {
 		t.Errorf("nothing was pasted, got key body %q", keyBody)
 	}
-	if got != srv {
+	if !reflect.DeepEqual(got, srv) {
 		t.Errorf("round trip: got %+v, want %+v", got, srv)
 	}
 
@@ -507,7 +517,7 @@ func TestEditFormPrefills(t *testing.T) {
 	if body != "" {
 		t.Errorf("the key body must start empty, got %q", body)
 	}
-	if gotKey != keySrv {
+	if !reflect.DeepEqual(gotKey, keySrv) {
 		t.Errorf("round trip: got %+v, want %+v", gotKey, keySrv)
 	}
 }
