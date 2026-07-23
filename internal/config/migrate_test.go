@@ -90,13 +90,7 @@ func TestMigrationMovesPlaintextAndDeletesIt(t *testing.T) {
 	if rep.BackupPath == "" {
 		t.Fatal("no backup path reported")
 	}
-	info, err := os.Stat(rep.BackupPath)
-	if err != nil {
-		t.Fatalf("stat backup: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("backup permissions: got %04o, want 0600", perm)
-	}
+	wantPerm0600(t, rep.BackupPath, "backup")
 	bak, err := os.ReadFile(rep.BackupPath)
 	if err != nil {
 		t.Fatal(err)

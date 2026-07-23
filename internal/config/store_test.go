@@ -133,13 +133,7 @@ func TestSaveKeyIs0600(t *testing.T) {
 		t.Errorf("path: got %q, want %q", path, want)
 	}
 
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat key: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("key permissions: got %04o, want 0600", perm)
-	}
+	wantPerm0600(t, path, "key")
 
 	got, err := os.ReadFile(path)
 	if err != nil {
@@ -287,13 +281,7 @@ func TestAppendKnownHost(t *testing.T) {
 		t.Errorf("known_hosts: got %q, want %q", b, want)
 	}
 
-	info, err := os.Stat(s.KnownHostsPath())
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("known_hosts mode: got %o, want 600", perm)
-	}
+	wantPerm0600(t, s.KnownHostsPath(), "known_hosts")
 
 	if !contains(s.KnownHostsFiles(), s.KnownHostsPath()) {
 		t.Error("our known_hosts should be listed once it exists")
@@ -354,6 +342,27 @@ func TestDefaultPathUnchanged(t *testing.T) {
 	}
 	if want := filepath.Join(home, ".config", "ssh-client"); s.Dir() != want {
 		t.Errorf("Dir() = %q, want %q", s.Dir(), want)
+	}
+}
+
+// wantPerm0600 checks that a file we created is not readable by anyone else.
+//
+// Windows is skipped rather than weakened: Go reports 0666 for every file it
+// creates there, and v8 deliberately does not hand-build an ACL to fake the
+// unix bits — that would be a promise we cannot keep. On that platform the
+// protection is that the vault is ciphertext, which the vault tests cover on
+// every OS. The file still has to exist, so the stat is not skipped.
+func wantPerm0600(t *testing.T, path, what string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", what, err)
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("%s permissions: got %04o, want 0600", what, perm)
 	}
 }
 

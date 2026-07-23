@@ -41,13 +41,7 @@ func TestVaultRoundTripAndFileIs0600(t *testing.T) {
 	if !s.HasVault() {
 		t.Fatal("HasVault should be true after a save")
 	}
-	info, err := os.Stat(s.VaultPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("vault permissions: got %04o, want 0600", perm)
-	}
+	wantPerm0600(t, s.VaultPath(), "vault")
 
 	raw, err := os.ReadFile(s.VaultPath())
 	if err != nil {
