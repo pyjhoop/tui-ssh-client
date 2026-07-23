@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
@@ -274,12 +275,42 @@ func TestCopyEmitsOSC52Once(t *testing.T) {
 		t.Error("the frame does not carry the clipboard sequence")
 	}
 
+	// Several frames may be drawn before the flush: the renderer keeps only the
+	// newest View output and paints it on a ticker, so a sequence that lived in
+	// exactly one frame was usually never written at all. Redrawing must not
+	// consume it.
+	app.View()
+	if !strings.Contains(app.View(), "\x1b]52;") {
+		t.Error("the sequence was gone by the second frame — the renderer may never have painted it")
+	}
+
 	runCmd(app, cmd) // the flush message the runtime would deliver
 	if app.clip != "" {
 		t.Error("the sequence was not cleared")
 	}
 	if strings.Contains(app.View(), "\x1b]52;") {
 		t.Error("the clipboard sequence is still in the next frame")
+	}
+}
+
+// TestCopyHoldsSequenceForSeveralFrames pins the fix for the bug that made
+// drag-copy look broken: the flush must be delayed, not immediate. Bubble Tea's
+// standard renderer stores only the newest frame and paints on a 60fps ticker,
+// so a frame produced and replaced within 16ms never reaches the terminal.
+func TestCopyHoldsSequenceForSeveralFrames(t *testing.T) {
+	app, _ := selectApp(t, "copy me")
+	cmd := drag(app, 0, 0, 6, 0)
+	if cmd == nil {
+		t.Fatal("the release returned no command")
+	}
+
+	start := time.Now()
+	msg := cmd()
+	if _, ok := msg.(clipFlushMsg); !ok {
+		t.Fatalf("the command produced %T, want clipFlushMsg", msg)
+	}
+	if waited := time.Since(start); waited < 2*time.Second/60 {
+		t.Errorf("the flush came after %v — too soon for the renderer to have painted a frame", waited)
 	}
 }
 

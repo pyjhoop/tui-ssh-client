@@ -155,8 +155,9 @@ type App struct {
 	failErr     error
 
 	// clip is an OSC 52 clipboard sequence waiting to go out. View writes it as a
-	// prefix to exactly one frame and clipFlushMsg clears it: the renderer owns
-	// stdout, so the only way to send a sequence is to put it in the frame.
+	// prefix and clipFlushMsg clears it a moment later: the renderer owns stdout,
+	// so the only way to send a sequence is to put it in a frame — and it has to
+	// stay there long enough for the renderer's ticker to paint one (clipHold).
 	clip string
 
 	status   string
@@ -265,9 +266,9 @@ type sessionEndedMsg struct {
 	err error
 }
 
-// clipFlushMsg drops the clipboard sequence again, one frame after View sent it.
-// The round trip is the point: it is what keeps the escape out of every frame
-// but the one that carries it.
+// clipFlushMsg drops the clipboard sequence again once the renderer has had
+// time to paint it (see clipHold). The round trip is the point: it keeps the
+// escape out of every frame except the ones that carry it.
 type clipFlushMsg struct{}
 
 // reconnectMsg fires when a lost tab's backoff expires. It carries the
@@ -1941,8 +1942,8 @@ func (a *App) copySelection(t *sessionTab, sel selection) tea.Cmd {
 	}
 
 	text, cut := truncateClip(text)
-	// The sequence goes out as a prefix on the next frame; the flush message
-	// removes it again, so it exists in exactly one frame and never twice.
+	// The sequence goes out as a prefix on the frames drawn over the next
+	// clipHold, and clipFlushMsg takes it down again.
 	a.clip = ansi.SetSystemClipboard(text)
 	if cut {
 		a.status = fmt.Sprintf("copied %s (truncated)", humanSize(int64(len(text))))
@@ -1950,8 +1951,21 @@ func (a *App) copySelection(t *sessionTab, sel selection) tea.Cmd {
 		a.status = "copied " + plural(strings.Count(text, "\n")+1, "line")
 	}
 	a.errMsg = ""
-	return func() tea.Msg { return clipFlushMsg{} }
+	return tea.Tick(clipHold, func(time.Time) tea.Msg { return clipFlushMsg{} })
 }
+
+// clipHold is how long the clipboard sequence stays in the frame.
+//
+// It cannot be a single frame. Bubble Tea's standard renderer keeps only the
+// newest View output — write() resets the buffer — and paints it on a 60fps
+// ticker, so a frame produced and replaced inside those 16ms is never written
+// at all. Returning the flush message immediately did exactly that: the escape
+// went into a buffer that the next Update overwrote before the renderer ever
+// looked, and the copy silently did nothing.
+//
+// Holding it for several frames costs nothing: the renderer skips lines that
+// have not changed, so the sequence still reaches the terminal once.
+const clipHold = 150 * time.Millisecond
 
 // truncateClip cuts the text to clipLimit bytes without splitting a rune, and
 // says whether it had to.
@@ -2145,7 +2159,8 @@ func (a *App) View() string {
 	// A pending clipboard write rides out as a prefix. OSC 52 is zero columns
 	// wide, so it passes through padLine and the layout invariants untouched —
 	// and writing to stdout ourselves would land in the middle of a frame the
-	// renderer owns.
+	// renderer owns. It stays for clipHold because one frame may never be
+	// painted at all.
 	if a.clip != "" {
 		screen = a.clip + screen
 	}
