@@ -14,7 +14,6 @@ import (
 	"time"
 
 	xssh "golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/pyjhoop/ssh-client/internal/model"
 )
@@ -417,24 +416,6 @@ func keySigner(srv model.Server) (xssh.Signer, error) {
 		return nil, fmt.Errorf("%w: parse key %s: %w", ErrKeyFile, source, err)
 	}
 	return signer, nil
-}
-
-// agentSigners connects to the agent named by SSH_AUTH_SOCK. There is no
-// fallback to another method on purpose: silently authenticating some other way
-// would leave the user unable to tell which credential was used.
-//
-// The connection is returned rather than closed here because the agent does the
-// signing: it has to stay open for the whole handshake.
-func agentSigners() (net.Conn, func() ([]xssh.Signer, error), error) {
-	sock := os.Getenv("SSH_AUTH_SOCK")
-	if sock == "" {
-		return nil, nil, fmt.Errorf("%w: SSH_AUTH_SOCK is not set", ErrAgentUnavailable)
-	}
-	conn, err := net.Dial("unix", sock)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: connect to %s: %w", ErrAgentUnavailable, sock, err)
-	}
-	return conn, agent.NewClient(conn).Signers, nil
 }
 
 func termType() string {

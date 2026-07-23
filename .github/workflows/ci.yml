@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - run: go vet ./...
+
+      - run: go build ./...
+
+      # The vault is scrypt at work factor 19, which costs seconds per
+      # operation under -race. Running it on all three platforms would multiply
+      # CI time for the same answer, so the race detector runs on Linux only.
+      - name: test (race)
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -race ./internal/... .
+
+      - name: test
+        if: matrix.os != 'ubuntu-latest'
+        run: go test ./internal/... .

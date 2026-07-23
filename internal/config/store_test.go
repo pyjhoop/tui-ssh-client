@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -315,6 +316,44 @@ func TestOwnsKey(t *testing.T) {
 	}
 	if s.OwnsKey("") {
 		t.Error("an empty path is not ours")
+	}
+}
+
+// TestXDGWinsOnEveryOS: XDG_CONFIG_HOME is what the whole test suite points at,
+// and it has to keep winning wherever it is set — including Windows, where the
+// native location is different.
+func TestXDGWinsOnEveryOS(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	s, err := config.Default()
+	if err != nil {
+		t.Fatalf("Default: %v", err)
+	}
+	if want := filepath.Join(dir, "ssh-client"); s.Dir() != want {
+		t.Errorf("Dir() = %q, want %q", s.Dir(), want)
+	}
+}
+
+// TestDefaultPathUnchanged: v8 added a Windows branch to Default(); the unix
+// path must not have moved by one character, or an existing installation's
+// server list and vault look lost.
+func TestDefaultPathUnchanged(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix layout")
+	}
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("no home directory: %v", err)
+	}
+	s, err := config.Default()
+	if err != nil {
+		t.Fatalf("Default: %v", err)
+	}
+	if want := filepath.Join(home, ".config", "ssh-client"); s.Dir() != want {
+		t.Errorf("Dir() = %q, want %q", s.Dir(), want)
 	}
 }
 

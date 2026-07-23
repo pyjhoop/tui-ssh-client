@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/google/uuid"
@@ -36,15 +37,29 @@ func New(dir string) *Store {
 	return &Store{dir: dir}
 }
 
-// Default resolves the XDG config location.
+// Default resolves the config location: XDG_CONFIG_HOME on every OS if it is
+// set, then the platform's own place.
+//
+// The unix branch is deliberately not os.UserConfigDir(): on macOS that answers
+// ~/Library/Application Support, which would move an existing installation's
+// server list and vault and make them look lost. Only Windows, which has never
+// had a location here to keep, gets the native one (%AppData%).
 func Default() (*Store, error) {
 	base := os.Getenv("XDG_CONFIG_HOME")
 	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("resolve home directory: %w", err)
+		var err error
+		if runtime.GOOS == "windows" {
+			base, err = os.UserConfigDir()
+			if err != nil {
+				return nil, fmt.Errorf("resolve config directory: %w", err)
+			}
+		} else {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return nil, fmt.Errorf("resolve home directory: %w", err)
+			}
+			base = filepath.Join(home, ".config")
 		}
-		base = filepath.Join(home, ".config")
 	}
 	return New(filepath.Join(base, appDir)), nil
 }

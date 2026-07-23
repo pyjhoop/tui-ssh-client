@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
+	"runtime/debug"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -20,13 +22,29 @@ import (
 	"github.com/pyjhoop/ssh-client/internal/vault"
 )
 
+// Build stamps. The single source of truth for a release is the git tag:
+// goreleaser injects these with -ldflags -X. They are deliberately not edited
+// by hand for a release — a constant in the source and a tag drift apart.
+var (
+	version = "dev"
+	commit  = ""
+	date    = ""
+)
+
 func main() {
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	pull := flag.Bool("pull", false, "fetch the encrypted bundle from the sync repository before starting")
 	repo := flag.String("repo", "", "owner/name of the sync repository (only needed the first time on a machine)")
 	path := flag.String("path", ui.DefaultBundlePath, "path to the bundle inside the repository")
 	var keys keysFlag
 	flag.Var(&keys, "keys", "print the key bindings and exit; --keys=json prints them as keys.json")
 	flag.Parse()
+
+	// Like --keys: read the flag, print, exit. No TUI, no config directory.
+	if *showVersion {
+		fmt.Println(buildVersion())
+		return
+	}
 
 	store, err := config.Default()
 	if err != nil {
@@ -59,6 +77,51 @@ func main() {
 	if _, err := p.Run(); err != nil {
 		fail(err)
 	}
+}
+
+// buildVersion is one line: version, commit, build date, toolchain, platform.
+//
+// A binary from a release has all of it injected. One installed with
+// `go install …@latest` has no ldflags at all, so the commit and date come from
+// the VCS stamps the toolchain embeds — that path must still say something more
+// useful than "dev".
+func buildVersion() string {
+	v, c, d := version, commit, date
+	if v == "dev" || c == "" || d == "" {
+		if info, ok := debug.ReadBuildInfo(); ok {
+			for _, s := range info.Settings {
+				switch s.Key {
+				case "vcs.revision":
+					if c == "" {
+						c = s.Value
+					}
+				case "vcs.time":
+					if d == "" {
+						d = s.Value
+					}
+				case "vcs.modified":
+					if s.Value == "true" {
+						v += "+dirty"
+					}
+				}
+			}
+			if v == "dev" && info.Main.Version != "" && info.Main.Version != "(devel)" {
+				v = info.Main.Version
+			}
+		}
+	}
+	if len(c) > 7 {
+		c = c[:7]
+	}
+
+	parts := []string{}
+	for _, p := range []string{c, d} {
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
+	parts = append(parts, runtime.Version(), runtime.GOOS+"/"+runtime.GOARCH)
+	return fmt.Sprintf("ssh-client %s (%s)", v, strings.Join(parts, ", "))
 }
 
 // keysFlag makes --keys work with and without a value: bare it prints the

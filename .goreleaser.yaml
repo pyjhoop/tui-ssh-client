@@ -1,0 +1,81 @@
+version: 2
+
+project_name: ssh-client
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: ssh-client
+    main: .
+    binary: ssh-client
+    # A release is one static binary. No cgo means no glibc version to match,
+    # and no assets means nothing to install beside it: the config directory is
+    # created on first run, or not at all.
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: default
+    # install.sh builds this name from uname output — changing it breaks
+    # already-published installers.
+    name_template: "ssh-client_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  # install.sh and install.ps1 depend on this exact file name.
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: github
+  filters:
+    exclude:
+      - "^Merge "
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Docs
+      regexp: '^.*?docs(\(.+\))??!?:.+$'
+      order: 2
+    - title: Others
+      order: 999
+
+release:
+  footer: |
+    ## Install
+
+    ```sh
+    curl -fsSL https://raw.githubusercontent.com/pyjhoop/ssh-client/main/install.sh | sh
+    ```
+    ```powershell
+    irm https://raw.githubusercontent.com/pyjhoop/ssh-client/main/install.ps1 | iex
+    ```
+    ```sh
+    go install github.com/pyjhoop/ssh-client@{{ .Tag }}
+    ```
