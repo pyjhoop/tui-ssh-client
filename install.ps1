@@ -1,6 +1,6 @@
 # Install ssh-client from a GitHub release.
 #
-#   irm https://raw.githubusercontent.com/pyjhoop/ssh-client/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/pyjhoop/tui-ssh-client/main/install.ps1 | iex
 #
 # Environment:
 #   $env:VERSION      tag to install (default: the latest release)
@@ -13,7 +13,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$Repo = 'pyjhoop/ssh-client'
+$Repo = 'pyjhoop/tui-ssh-client'
 $InstallDir = if ($env:INSTALL_DIR) { $env:INSTALL_DIR }
               else { Join-Path $env:LOCALAPPDATA 'Programs\ssh-client' }
 
@@ -23,7 +23,7 @@ function Die($msg) { Write-Error "install.ps1: $msg"; exit 1 }
 $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
     'AMD64' { 'amd64' }
     'ARM64' { 'arm64' }
-    'x86'   { Die 'ssh-client is not built for 32-bit Windows. Build it with: go install github.com/pyjhoop/ssh-client@latest' }
+    'x86'   { Die 'ssh-client is not built for 32-bit Windows. Build it with: go install github.com/pyjhoop/tui-ssh-client@latest' }
     default { Die "unsupported architecture '$($env:PROCESSOR_ARCHITECTURE)'" }
 }
 

@@ -17,9 +17,9 @@ import (
 	xssh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 
-	"github.com/pyjhoop/ssh-client/internal/model"
-	sftppkg "github.com/pyjhoop/ssh-client/internal/sftp"
-	sshpkg "github.com/pyjhoop/ssh-client/internal/ssh"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
+	sftppkg "github.com/pyjhoop/tui-ssh-client/internal/sftp"
+	sshpkg "github.com/pyjhoop/tui-ssh-client/internal/ssh"
 )
 
 // TestRemoteRoundTrip covers the whole transfer path against an in-process SFTP

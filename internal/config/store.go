@@ -13,7 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/pyjhoop/ssh-client/internal/model"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
 )
 
 const (

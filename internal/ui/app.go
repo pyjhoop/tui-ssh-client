@@ -15,11 +15,11 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/pyjhoop/ssh-client/internal/config"
-	"github.com/pyjhoop/ssh-client/internal/model"
-	sftppkg "github.com/pyjhoop/ssh-client/internal/sftp"
-	sshpkg "github.com/pyjhoop/ssh-client/internal/ssh"
-	"github.com/pyjhoop/ssh-client/internal/vault"
+	"github.com/pyjhoop/tui-ssh-client/internal/config"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
+	sftppkg "github.com/pyjhoop/tui-ssh-client/internal/sftp"
+	sshpkg "github.com/pyjhoop/tui-ssh-client/internal/ssh"
+	"github.com/pyjhoop/tui-ssh-client/internal/vault"
 )
 
 type focusArea int

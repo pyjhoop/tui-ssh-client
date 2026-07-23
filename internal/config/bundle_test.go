@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pyjhoop/ssh-client/internal/config"
-	"github.com/pyjhoop/ssh-client/internal/model"
-	"github.com/pyjhoop/ssh-client/internal/vault"
+	"github.com/pyjhoop/tui-ssh-client/internal/config"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
+	"github.com/pyjhoop/tui-ssh-client/internal/vault"
 )
 
 // Two host key lines for the same host, differing only in the key. That

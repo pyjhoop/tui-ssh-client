@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	sftppkg "github.com/pyjhoop/ssh-client/internal/sftp"
+	sftppkg "github.com/pyjhoop/tui-ssh-client/internal/sftp"
 )
 
 // TestProgressCountsAndCancels covers the two things the status line and the

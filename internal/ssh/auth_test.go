@@ -15,8 +15,8 @@ import (
 	xssh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 
-	"github.com/pyjhoop/ssh-client/internal/model"
-	sshpkg "github.com/pyjhoop/ssh-client/internal/ssh"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
+	sshpkg "github.com/pyjhoop/tui-ssh-client/internal/ssh"
 )
 
 // newKey returns a fresh ed25519 key in both the forms the tests need.

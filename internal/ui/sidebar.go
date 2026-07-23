@@ -9,7 +9,7 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/pyjhoop/ssh-client/internal/model"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
 )
 
 // sidebarWidth is the fixed outer width of the left panel.

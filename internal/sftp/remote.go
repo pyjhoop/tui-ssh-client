@@ -9,8 +9,8 @@ import (
 	pkgsftp "github.com/pkg/sftp"
 	xssh "golang.org/x/crypto/ssh"
 
-	"github.com/pyjhoop/ssh-client/internal/model"
-	sshpkg "github.com/pyjhoop/ssh-client/internal/ssh"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
+	sshpkg "github.com/pyjhoop/tui-ssh-client/internal/ssh"
 )
 
 // Remote browses a server over SFTP. Its TCP connection is its own: closing the

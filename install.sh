@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install ssh-client from a GitHub release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/pyjhoop/ssh-client/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/pyjhoop/tui-ssh-client/main/install.sh | sh
 #
 # Environment:
 #   VERSION      tag to install (default: the latest release)
@@ -12,7 +12,7 @@
 # or run it yourself with INSTALL_DIR=/usr/local/bin and your own sudo.
 set -eu
 
-REPO="pyjhoop/ssh-client"
+REPO="pyjhoop/tui-ssh-client"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
 say() { printf '%s\n' "$*"; }

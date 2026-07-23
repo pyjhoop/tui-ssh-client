@@ -9,9 +9,9 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 
-	"github.com/pyjhoop/ssh-client/internal/config"
-	"github.com/pyjhoop/ssh-client/internal/model"
-	sshpkg "github.com/pyjhoop/ssh-client/internal/ssh"
+	"github.com/pyjhoop/tui-ssh-client/internal/config"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
+	sshpkg "github.com/pyjhoop/tui-ssh-client/internal/ssh"
 )
 
 // helpApp is a root model with a couple of servers, big enough for the card.

@@ -16,10 +16,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"golang.org/x/term"
 
-	"github.com/pyjhoop/ssh-client/internal/config"
-	syncpkg "github.com/pyjhoop/ssh-client/internal/sync"
-	"github.com/pyjhoop/ssh-client/internal/ui"
-	"github.com/pyjhoop/ssh-client/internal/vault"
+	"github.com/pyjhoop/tui-ssh-client/internal/config"
+	syncpkg "github.com/pyjhoop/tui-ssh-client/internal/sync"
+	"github.com/pyjhoop/tui-ssh-client/internal/ui"
+	"github.com/pyjhoop/tui-ssh-client/internal/vault"
 )
 
 // Build stamps. The single source of truth for a release is the git tag:

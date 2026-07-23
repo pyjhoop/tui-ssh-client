@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pyjhoop/ssh-client/internal/config"
-	"github.com/pyjhoop/ssh-client/internal/model"
-	"github.com/pyjhoop/ssh-client/internal/vault"
+	"github.com/pyjhoop/tui-ssh-client/internal/config"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
+	"github.com/pyjhoop/tui-ssh-client/internal/vault"
 )
 
 // legacyConfig writes a pre-v6 servers.json by hand: model.Server no longer

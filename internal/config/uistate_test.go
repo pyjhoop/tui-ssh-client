@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/pyjhoop/ssh-client/internal/model"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
 )
 
 func TestUIStateRoundTrip(t *testing.T) {

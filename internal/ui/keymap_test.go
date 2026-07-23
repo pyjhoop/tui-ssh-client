@@ -8,8 +8,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/pyjhoop/ssh-client/internal/config"
-	"github.com/pyjhoop/ssh-client/internal/model"
+	"github.com/pyjhoop/tui-ssh-client/internal/config"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
 )
 
 // TestDefaultsMatchV6 pins every key the app answered to before the registry

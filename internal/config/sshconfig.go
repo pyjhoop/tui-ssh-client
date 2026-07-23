@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pyjhoop/ssh-client/internal/model"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
 )
 
 // ImportGroup is the group import puts its entries in. It is only a default —

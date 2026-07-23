@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/pyjhoop/ssh-client/internal/config"
+	"github.com/pyjhoop/tui-ssh-client/internal/config"
 )
 
 // Context is where a key means something. Exactly one context is active when a

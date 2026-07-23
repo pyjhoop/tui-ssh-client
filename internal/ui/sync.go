@@ -9,9 +9,9 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/pyjhoop/ssh-client/internal/config"
-	syncpkg "github.com/pyjhoop/ssh-client/internal/sync"
-	"github.com/pyjhoop/ssh-client/internal/vault"
+	"github.com/pyjhoop/tui-ssh-client/internal/config"
+	syncpkg "github.com/pyjhoop/tui-ssh-client/internal/sync"
+	"github.com/pyjhoop/tui-ssh-client/internal/vault"
 )
 
 // DefaultBundlePath is where the encrypted bundle lands in the repository. The

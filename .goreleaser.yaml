@@ -71,11 +71,11 @@ release:
     ## Install
 
     ```sh
-    curl -fsSL https://raw.githubusercontent.com/pyjhoop/ssh-client/main/install.sh | sh
+    curl -fsSL https://raw.githubusercontent.com/pyjhoop/tui-ssh-client/main/install.sh | sh
     ```
     ```powershell
-    irm https://raw.githubusercontent.com/pyjhoop/ssh-client/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/pyjhoop/tui-ssh-client/main/install.ps1 | iex
     ```
     ```sh
-    go install github.com/pyjhoop/ssh-client@{{ .Tag }}
+    go install github.com/pyjhoop/tui-ssh-client@{{ .Tag }}
     ```

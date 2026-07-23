@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pyjhoop/ssh-client/internal/config"
-	"github.com/pyjhoop/ssh-client/internal/vault"
+	"github.com/pyjhoop/tui-ssh-client/internal/config"
+	"github.com/pyjhoop/tui-ssh-client/internal/vault"
 )
 
 const testPass = "a decent passphrase"

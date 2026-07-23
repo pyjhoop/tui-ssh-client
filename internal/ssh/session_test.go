@@ -18,8 +18,8 @@ import (
 	xssh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 
-	"github.com/pyjhoop/ssh-client/internal/model"
-	sshpkg "github.com/pyjhoop/ssh-client/internal/ssh"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
+	sshpkg "github.com/pyjhoop/tui-ssh-client/internal/ssh"
 )
 
 // TestConnectPumpsOutputAndForwardsInput runs the real Connect path against an

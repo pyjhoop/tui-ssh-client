@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/pyjhoop/ssh-client/internal/model"
-	"github.com/pyjhoop/ssh-client/internal/vault"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
+	"github.com/pyjhoop/tui-ssh-client/internal/vault"
 )
 
 // plaintextBackupFile is the copy left behind before the cleartext secrets are

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	syncpkg "github.com/pyjhoop/ssh-client/internal/sync"
+	syncpkg "github.com/pyjhoop/tui-ssh-client/internal/sync"
 )
 
 const testToken = "ghp_supersecrettoken"

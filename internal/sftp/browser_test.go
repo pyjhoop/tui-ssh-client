@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	sftppkg "github.com/pyjhoop/ssh-client/internal/sftp"
+	sftppkg "github.com/pyjhoop/tui-ssh-client/internal/sftp"
 )
 
 // TestLocalListSortsDirsFirst pins the ordering both panes depend on, plus the

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	sftppkg "github.com/pyjhoop/ssh-client/internal/sftp"
+	sftppkg "github.com/pyjhoop/tui-ssh-client/internal/sftp"
 )
 
 // TestPlanWalksATree pins what the confirmation panel and the progress bar are

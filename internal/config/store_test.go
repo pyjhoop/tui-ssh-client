@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pyjhoop/ssh-client/internal/config"
-	"github.com/pyjhoop/ssh-client/internal/model"
+	"github.com/pyjhoop/tui-ssh-client/internal/config"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
 )
 
 func TestLoadMissingFileIsEmpty(t *testing.T) {

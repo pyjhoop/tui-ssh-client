@@ -1,4 +1,4 @@
-module github.com/pyjhoop/ssh-client
+module github.com/pyjhoop/tui-ssh-client
 
 go 1.25.0
 

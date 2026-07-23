@@ -15,7 +15,7 @@ import (
 
 	xssh "golang.org/x/crypto/ssh"
 
-	"github.com/pyjhoop/ssh-client/internal/model"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
 )
 
 // DialTimeout bounds the TCP + handshake phase.

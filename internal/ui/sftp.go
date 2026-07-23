@@ -11,9 +11,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/pyjhoop/ssh-client/internal/config"
-	"github.com/pyjhoop/ssh-client/internal/model"
-	sftppkg "github.com/pyjhoop/ssh-client/internal/sftp"
+	"github.com/pyjhoop/tui-ssh-client/internal/config"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
+	sftppkg "github.com/pyjhoop/tui-ssh-client/internal/sftp"
 )
 
 // parentName is the row that walks up a level. It is drawn by the pane rather

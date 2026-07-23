@@ -11,15 +11,15 @@
 ## 설치
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/pyjhoop/ssh-client/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/pyjhoop/tui-ssh-client/main/install.sh | sh
 ```
 
 ```powershell
-irm https://raw.githubusercontent.com/pyjhoop/ssh-client/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/pyjhoop/tui-ssh-client/main/install.ps1 | iex
 ```
 
 ```sh
-go install github.com/pyjhoop/ssh-client@latest
+go install github.com/pyjhoop/tui-ssh-client@latest
 ```
 
 설치 스크립트는 릴리스 아카이브와 `checksums.txt`를 함께 받아 **sha256을 대조한 뒤에만**

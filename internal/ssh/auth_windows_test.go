@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/pyjhoop/ssh-client/internal/model"
-	sshpkg "github.com/pyjhoop/ssh-client/internal/ssh"
+	"github.com/pyjhoop/tui-ssh-client/internal/model"
+	sshpkg "github.com/pyjhoop/tui-ssh-client/internal/ssh"
 )
 
 // TestMissingAgentIsErrAgentUnavailable is the Windows half of the v6 rule: no
